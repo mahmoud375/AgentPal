@@ -4,8 +4,9 @@ AgentPal is a policy-controlled AI procurement/payment simulation for one owner.
 Channel3 discovers retailer listings; PayPal Sandbox payments go to AgentPal's
 single demo Business account. The application does not order or fulfill goods
 from those retailers. The FastAPI health endpoint, PostgreSQL persistence and
-single-owner authentication and owner policy/budget APIs are implemented;
-purchasing is not yet integrated.
+single-owner authentication, owner policy/budget APIs and a reusable Channel3
+discovery/transient-selection foundation and durable initial purchase proposals
+are implemented. Human approval, reservations and payment execution services are pending.
 
 The [authoritative context](docs/AgentPal_Full_Context_Handoff.md) records approved
 decisions, completed experiments and remaining integration work.
@@ -50,6 +51,277 @@ Their explicit empty password file is created inside the disposable directory.
 Missing PostgreSQL binaries cause integration tests to skip, not to simulate
 PostgreSQL with SQLite. Test money, hashes, ciphertext and provider identifiers
 are fictional fixtures; no PayPal or Channel3 calls occur.
+
+## Channel3 discovery and transient offer selection
+
+`agentpal.channel3` and `agentpal.discovery` provide reusable asynchronous backend
+functions. They add no HTTP endpoints, so there is no unauthenticated discovery
+surface or new owner-session bypass. The future trusted agent runtime must bind
+these functions to its authenticated owner and verified agent/run context. No
+PydanticAI agent or payment is implemented. The proposal service below consumes
+this foundation for independent retrieval and deterministic initial evaluation.
+
+Privately export `CHANNEL3_API_KEY` before constructing `Channel3Settings()`.
+The variable already appears as an empty placeholder in `.env.example`; no dotenv
+file is opened. Imports and `/health` need no Channel3 configuration. Settings
+hide the key in representations/validation messages. Do not log settings dumps,
+request headers, source bodies, registry contents or opaque references.
+
+| Operation | Fixed Channel3 contract |
+|---|---|
+| `Channel3Client.search(query, limit=3)` | `POST https://api.trychannel3.com/v1/search`, JSON `{"query": "…", "limit": 3}`; root `products` array |
+| `Channel3Client.retrieve(product_id)` | `GET https://api.trychannel3.com/v1/products/{product_id}`; root product object with exactly the requested `id` |
+
+Requests use `x-api-key` and JSON Accept headers, no environment proxies,
+redirects or automatic retries. No retailer or source-supplied URL is fetched;
+the separate credit-consuming URL lookup API is not used. Queries are 1–200
+characters, limits 1–5, and product IDs are 1–200 ASCII alphanumeric/underscore/
+hyphen characters. Each operation has a 45-second total network deadline,
+5-second connect and 10-second I/O timeouts, a 2 MB response bound and at most
+1,000 offers per product. Oversized results fail closed. Compressed responses
+are rejected; the adapter requests `Accept-Encoding: identity` to avoid
+unbounded decompression. Duplicate JSON keys and nonfinite JSON numbers fail.
+There is no pagination implementation. Every returned offer is scanned before
+display is capped at 50 candidates (or the registry's smaller per-run capacity).
+
+The spike establishes the field-mapping basis, rather than a checked-in raw
+provider response. Supported products require `id`, bounded `title` and an
+`offers` array. Every offer needs a usable `domain`, exact USD `price`, and HTTPS
+`url`; optional `condition` is bounded text or null. ASCII domains are lowercased
+and strictly validated, without merging `www` or subdomains; URLs, ports, IP
+literals, trailing dots and whitespace are not merchant domains. The entire
+exact URL, including attribution/query, becomes a SHA-256 fingerprint and is
+discarded in clear. Affiliate hosts may differ from the merchant domain; neither
+the URL nor domain proves legal seller identity. URL attribution changes therefore
+block comparison conservatively, even if the underlying retailer item is unchanged.
+
+Prices use `price.price`, with an isolated compatibility mapping for `price.amount`
+noted in the spike's reference/guide discrepancy. If both exist, both must be valid
+and equal. `price.currency` must be exactly `USD`. Strings use ordinary nonnegative
+decimal notation; JSON numeric values are decoded directly to Decimal. Floats,
+fractional cents, nonfinite/negative amounts, malformed or inconsistent aliases
+are rejected without rounding. Values have a computational bound of 30 integer
+digits; this is not a configured financial limit. `compare_at_price` never sets
+the purchase price. No tax, shipping, FX or checkout calculation is performed.
+
+Only exact `InStock` reports `availability="available"`; `OutOfStock` reports
+`"unavailable"`; all other/missing/malformed values report `"unknown"`. Valid
+unavailable/unknown listings can have references but are not purchase candidates.
+`purchase_candidate` describes source availability on a structurally valid listing,
+not policy eligibility or spending authorization. Structurally valid prohibited
+merchants are retained so the future policy engine can issue an actual
+`MERCHANT_NOT_ALLOWED` decision. Malformed offers are rejected. Duplicate canonical
+domains within one product are ambiguous even when a duplicate is malformed or
+out of stock; none of that merchant's offers is selectable. A missing/invalid
+domain makes the whole product unsupported because hidden duplication cannot be
+ruled out. Duplicate product IDs in one search are also rejected. Other valid
+products/merchants can still be returned, with rejection counts; detail retrieval
+fails safely if the required product structure is missing.
+
+Trusted backend usage (illustrative code; executing `search` makes a live request):
+
+```python
+from uuid import uuid4
+from agentpal.channel3 import Channel3Client, Channel3Settings
+from agentpal.discovery import DiscoveryService, OfferRegistry, RunContext
+
+# Once per backend process; never expose these objects/credentials to the model.
+registry = OfferRegistry()  # global 500 entries, per-run 100, absolute TTL 600s
+discovery = DiscoveryService(Channel3Client(Channel3Settings()), registry)
+
+# The authenticated runtime supplies these identities, never model/tool arguments.
+context = RunContext(owner_key=verified_owner_login, agent_id=verified_agent_id, run_id=uuid4())
+result = await discovery.search(context, query="wireless keyboard", limit=3)
+tool_result = [candidate.public() for candidate in result.candidates]
+# A future tool receives only query; the proposal service accepts ref + quantity.
+# It closes over context and never accepts owner/run/merchant/price from the AI.
+evidence = discovery.resolve(context, selected_offer_ref)
+refresh = await discovery.refresh(context, selected_offer_ref)
+# No purchase is created here. Even refresh.status == "passed" is not authorization.
+registry.discard_run(context)  # run completion/cancellation
+```
+
+`Candidate.public()` returns only reference, product ID, canonical merchant, an
+untrusted title, exact decimal-string price, USD, availability, bounded source
+availability, observation time and the structural candidate flag. Descriptions,
+raw URLs, fingerprints and provider blobs are omitted. Titles and any source text
+must remain data when rendered or placed in model context; they cannot change
+instructions, identity, price, policy or payee. Provider errors use fixed codes
+(`timeout`, `network_error`, `rate_limited`, `not_found`, `provider_failure`,
+`invalid_response`, `response_too_large`, `unsupported_encoding`) with no response
+bodies, exception details or Retry-After echo. Known literal key echoes are
+redacted from titles or rejected in identity fields. Failure is distinct from an
+empty successful search. Source strings remain untrusted, not generally certified
+secret-free content.
+
+References contain 32 random bytes, encoded as opaque 43-character URL-safe tokens.
+Only purpose-separated SHA-256 hashes are kept, bound to the full owner/agent/run
+context and frozen evidence. The lock-protected registry enforces global/per-run
+FIFO eviction and monotonic absolute expiry; reads do not extend TTL. Defaults
+can be configured in code within caps of 5,000 entries/3,600 seconds. Forged,
+cross-context, expired, evicted, canceled and restart-lost references all fail with
+`invalid_offer_reference`; repeat discovery. Run **one backend worker**. No discovery
+table, background worker, durable reference recovery or cross-process registry
+exists. A reference can be resolved repeatedly during its lifetime; durable proposal
+origin uniqueness/payment idempotency are separate future responsibilities.
+
+`resolve()` returns frozen `SelectionEvidence`, including the origin-reference
+hash and product/domain, URL fingerprint, nullable condition, matching-version
+`channel3-product-domain-url-condition-v1`, unique-offer count, exact USD price,
+source availability and local UTC retrieval time. This aligns with existing immutable
+purchase evidence fields but performs no database writes. `refresh()` always
+retrieves that product independently and compares only the original canonical
+merchant. It returns `passed`, `identity_changed`, `price_changed`, `unavailable`,
+`ambiguous`, `unsupported`, `missing` or `source_error`. It never substitutes a
+merchant, changes the original evidence or falls back to stored availability on
+failure. Both price increases and decreases block the old selection, as do URL/
+condition changes. New discovery is needed after a changed listing. Title changes
+alone are not identity evidence. Reference expiry/eviction during I/O is rechecked.
+
+The proposal service below independently refreshes before building its durable
+snapshot, evaluates actual policy/exact totals and enforces durable origin
+uniqueness. The future dispatch service must refresh/compare the **persisted
+snapshot** again; a transient reference need not survive proposal creation. It
+must handle policy/TTL/budget/dispatch races and cannot treat a prior passed refresh
+as ongoing permission. Discovery itself grants no approval or financial authority.
+
+**Evidence limits:** all new tests use explicitly synthetic responses and mocked
+HTTPX transports; no live call was made. Before live integration, verify actual
+`price.price` versus `price.amount` representation, optional condition/null behavior,
+all offers returned by detail/search, domain case/format, URL/attribution stability,
+response sizes/limits, identity encoding, compression support, and provider data-use/
+retention/display permissions. These conservative local restrictions are not claims
+about a guaranteed provider schema. Search/refresh timestamps are local observation
+times, not provider freshness guarantees. Latest successful Channel3 listing data
+is the approved Sandbox demonstration pricing basis, not guaranteed retailer
+checkout price or physical stock. All eventual payments still go to AgentPal's
+single PayPal Sandbox Business account; catalog retailers receive no demo payment
+and no actual order is placed or fulfilled.
+
+## Purchase proposals and deterministic initial evaluation
+
+`agentpal.proposals` connects the discovery service to the existing purchase and
+audit schema, with no new routes, tables, migrations, dependencies or environment
+variables. There is no public purchase API. The future trusted tool runtime closes
+over an authenticated run context; the model submits only a reference and quantity.
+It cannot provide price, merchant, policy, owner/session/agent IDs, approval or payee.
+
+| Internal contract | Behavior |
+|---|---|
+| `ProposalService(engine, discovery)` | Reuses the configured SQLAlchemy engine and `DiscoveryService`; no import-time DB or provider calls |
+| `start_run(owner, agent_id)` | Synchronous trusted launcher helper; accepts an authenticated `OwnerSession` from `OwnerRead`, rechecks active session/login/CSRF hash and enabled owned agent, returns a backend-generated `RunContext` |
+| `await create(context, offer_ref, quantity)` | Resolves durable replay first; otherwise independently refreshes and atomically creates/evaluates a proposal; returns frozen `ProposalResult` |
+| `ProposalResult.public()` | Allowlisted proposal ID, policy, product/merchant/title, decimal-string prices, quantity, initial decision/reasons, UTC creation/expiry, replay flag and observed expired/current-policy flags |
+| `exact_total(unit_price, quantity)` / `evaluate_policy(...)` | Exact multiplication and deterministic pure evaluation over trusted source/configuration/accounting inputs; not tools or spending capabilities |
+
+Trusted integration example (constructing services is inert; executing search or
+new-proposal creation calls Channel3):
+
+```python
+from agentpal.proposals import ProposalService
+
+proposals = ProposalService(engine, discovery)
+# Trusted launcher only: owner came from existing cookie authentication/OwnerRead.
+# Do not pass owner credentials/session objects or this launcher to the model.
+context = proposals.start_run(owner, verified_agent_id)
+
+async def propose_purchase(offer_ref: str, quantity: int) -> dict:
+    return (await proposals.create(context, offer_ref, quantity)).public()
+```
+
+Starting a run does not grant human approval authority. The internal Python
+`RunContext` constructor is not an authentication mechanism: never deserialize
+owner/agent/run identities from model arguments. `create()` rechecks the context's
+owner login against the single DB owner and the agent's enabled ownership. The
+registry verifies unused-reference ownership; committed replay verifies an immutable
+owner/agent/run context hash. No cookie or owner session is passed to agent tools.
+Owner logout does not itself cancel an already launched agent run; the future
+runtime must dispose/cancel its references when ending a run. Disabled agents are
+blocked from proposal creation/replay. Run restoration after restart must use
+verified owner/agent identity and the original run ID from trusted audit storage,
+never an AI-supplied claim. Replay cannot silently adopt a reference from another run.
+
+New proposals require a successful independent product-detail refresh with the
+same canonical merchant, full URL fingerprint, nullable condition and exact USD
+price—including rejection of decreases—and explicitly `InStock`. No merchant
+substitution, cached fallback or raw attributed URL is used. Source failures,
+missing/ambiguous/unavailable/changed offers and invalid references are validation
+errors, not fabricated `REJECTED` policy decisions; no purchase is inserted for
+them. An absent active policy raises `POLICY_SETUP_REQUIRED` without inventing
+financial defaults. Source network calls happen outside database transactions;
+sync database operations run off the async event loop.
+
+Quantity must be a strict positive Python integer within PostgreSQL BIGINT; bools,
+floats and strings are rejected. `unit_price × quantity` uses sufficient isolated
+Decimal precision without rounding, and PostgreSQL independently generates the
+stored total. The final transaction acquires the existing owner financial revision
+lock, rechecks agent/context and reference lifetime, reads the latest active policy,
+ensures the UTC month and reads `budget_balances`. Available funds use the same
+PostgreSQL NUMERIC expression as `/budget/current`, including conservative
+capture/protection accounting. No Python financial aggregation or invented hold
+is introduced. If the UTC month changes between initialization and observation,
+`BUDGET_PERIOD_CHANGED` safely rolls back; retry the same request.
+
+All rejection rules run in stable order, with an immutable rule trace:
+
+| Initial decision | Reasons |
+|---|---|
+| `REJECTED` | All failing rules among `MERCHANT_NOT_ALLOWED`, `HARD_PURCHASE_LIMIT_EXCEEDED`, `INSUFFICIENT_BUDGET` |
+| `AWAITING_HUMAN_APPROVAL` | `HUMAN_APPROVAL_REQUIRED`, when all rejection rules pass and total exceeds the automatic threshold |
+| `AUTO_AUTHORIZED` | `AUTO_APPROVAL_THRESHOLD_MET`, when all rejection rules pass and total is at/below the threshold |
+
+The hard limit is inclusive. Human approval cannot override a rejection. Internal
+database labels remain `rejected`, `awaiting_approval`, `auto_authorized`; public
+contracts use the uppercase decision names above. These are **initial decisions,
+not payment or current execution statuses**. Concurrent proposals can both appear
+affordable because neither reserves money. Final source/policy/TTL checks and
+atomic budget reservation remain mandatory in future dispatch, even for an
+initially `AUTO_AUTHORIZED` proposal.
+
+One successful transaction writes an immutable `purchases` snapshot, the existing
+trigger's `proposal_recorded` audit, and one `proposal_evaluated` agent audit. The
+latter records evaluation version, context hash/original run ID, budget period,
+observation time, exact limit/spending/protection/availability, total and boolean
+rule trace. Necessary source observations are stored in the purchase; no raw
+provider bodies, source descriptions, URL attribution, secrets or model rationale
+are stored in audits. PostgreSQL computes the snapshot hash and expiry from the
+evaluated immutable policy TTL. A UTC budget period may be initialized on demand.
+No approval, offer-revalidation dispatch record, reservation, payment or payment
+operation is created. Existing database guards remain unchanged.
+
+Idempotency uses the same purpose-separated reference hash as discovery and the
+existing unique purchase origin. A committed proposal is checked **before** the
+volatile registry or provider is required, including after registry loss/restart,
+expiry or policy change. Matching owner/agent/run and quantity return the original
+proposal and TTL; changed quantity raises `REFERENCE_QUANTITY_CONFLICT`.
+Cross-context replay is rejected before exposing quantity conflicts. Old externally
+inserted purchases without a unique `proposal_evaluated` context binding cannot
+be adopted. No new audit is emitted on replay and no financial operation restarts.
+Expired/stale-policy flags are observations at read time; they do not rewrite or
+re-authorize the original decision. Preserve them when showing replayed results.
+
+The owner lock serializes compliant duplicate submissions and financial writers;
+the unique origin remains the DB backstop. Serialization/deadlock/unique-origin
+conflicts roll back and check the durable winner in a new scope. If no winner has
+committed, return `TRANSACTION_CONFLICT` and retry the same request; there is no
+automatic source/payment retry. Deferred commit failures cannot return success.
+Storage failures expose only `PROPOSAL_STORAGE_UNAVAILABLE`; source errors use
+`OFFER_PRICE_CHANGED`, `OFFER_IDENTITY_CHANGED`, `OFFER_MISSING`, `OFFER_AMBIGUOUS`,
+`OFFER_UNAVAILABLE`, `OFFER_UNSUPPORTED` or `OFFER_SOURCE_ERROR`. Malformed/lost
+references use the existing `InvalidOfferReference`; errors never echo input,
+SQL or provider exception bodies. If a caller times out/cancels while a DB worker
+is already committing, it must retry the same reference/quantity to discover the
+durable outcome. A fresh reference creates a new proposal identity and proves
+nothing about recovery or replay of an uncertain PayPal payment.
+
+Remaining work includes authenticated human approval, pre-dispatch source refresh,
+final atomic financial eligibility/reservation, Vault setup and durable payment/
+reconciliation orchestration. No PayPal API is called here. Eventual payments go
+to **AgentPal's single PayPal Sandbox Business account**, not the catalog retailer;
+there is no retailer checkout, guaranteed stock or goods fulfillment. Before
+end-to-end judging, the previously documented live Channel3 price aliases, optional
+condition, URL stability, supported shapes/encoding and data-use permissions still
+need authorized verification; offline synthetic tests do not establish them.
 
 ## Single-owner authentication
 
@@ -312,11 +584,11 @@ SQL parameter values; connection strings are represented as secrets.
 
 There are no permanent discovery, product-catalog, webhook or organization tables.
 Decision 22 permits bounded run-local references and one backend process; their
-runtime implementation is a later task. Once submitted, the reference hash and
+runtime implementation now exists in `agentpal.discovery`. Once submitted, the reference hash and
 necessary selected-offer evidence become durable with the purchase. A unique
-origin hash prevents competing inserts for the same selection. Future services
-must return the existing proposal on a matching retry, reject changed quantity,
-and never use a new selection to recover an uncertain payment.
+origin hash prevents competing inserts for the same selection. `agentpal.proposals`
+returns the existing proposal on a matching trusted-context/quantity retry and
+rejects changed quantity. A new selection never proves safe recovery of an uncertain payment.
 
 ### Financial and authorization invariants
 
@@ -362,7 +634,8 @@ and never use a new selection to recover an uncertain payment.
   events. Database reservation/dispatch guards independently reject disallowed
   merchants, hard-limit violations, rejected proposals, missing human approval,
   expired proposals and stale policy versions. This is a final integrity guard;
-  the user-facing policy evaluation service is not implemented here.
+  the initial deterministic service is implemented in `agentpal.proposals`;
+  final dispatch and human approval services remain pending.
 - A passed source check must match product, domain, URL fingerprint, condition,
   unique-offer count, original price, USD and exactly `InStock`. Definitive
   identity/price/availability failures invalidate execution; a later passing

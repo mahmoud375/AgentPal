@@ -1,7 +1,7 @@
 # AgentPal — Full Project Context & Progress Handoff
 
 **Last updated:** 2026-10-21  
-**Status:** PayPal/Channel3 feasibility and the FastAPI foundation passed. PostgreSQL persistence, single-owner authentication and authenticated policy/monthly-budget APIs are implemented, including immediate current-month budget changes under approved Decision 25. Purchase evaluation, agent/payment integrations and end-to-end execution remain unimplemented.
+**Status:** PayPal/Channel3 feasibility and the FastAPI foundation passed. PostgreSQL persistence, owner authentication/policy/budget APIs, Channel3 discovery/transient references and idempotent purchase-proposal creation with deterministic initial policy evaluation are implemented. Provider behavior is tested offline with synthetic fixtures; live adapter compatibility remains unverified. Human approval, reservation/payment orchestration, agent runtime and end-to-end execution remain unimplemented.
 
 **Purpose:** The single authoritative project context for the existing AgentPal repository.
 
@@ -181,9 +181,9 @@ approved behavior and are not application defaults.
 
 The earlier intent example `product_id + quantity` is **insufficient**: product `PO7Dccd` appeared with offers from more than one merchant domain. Product identity alone cannot bind a proposal to the owner's intended merchant offer.
 
-Decision 22 selects a backend-issued transient reference as the purchase selection mechanism. **No independent stable Channel3 offer ID was observed; do not invent one.** The initial scope rejects multiple offers within the same product/domain. Conservative URL/condition comparison and exact source-adapter matching still require sanitized fixtures; a unique response representation does not prove stable retailer offer identity.
+Decision 22 selects a backend-issued transient reference as the purchase selection mechanism. **No independent stable Channel3 offer ID was observed; do not invent one.** The implemented adapter rejects multiple offers within the same product/canonical domain and conservatively compares the complete URL fingerprint and nullable condition. Explicitly synthetic fixtures exercise these rules; real URL/condition stability still requires authorized verification. A unique response representation does not prove stable retailer offer identity.
 
-Search selections stay in bounded run memory. Submitted purchases persist product/domain identity, URL fingerprint, condition, source observations, exact money, origin-reference hash and an immutable snapshot binding. The schema stores no permanent discovery registry or retailer catalog. Structurally valid prohibited merchants may reach proposal creation; the actual policy engine must reject them and preserve audit evidence. The AI tool/API runtime is not implemented here.
+Search selections stay in bounded process memory, bound to trusted owner/agent/run context. The proposal service now persists submitted product/domain identity, URL fingerprint, condition, source observations, exact money, origin-reference hash, evaluated policy/decision/reasons and immutable snapshot binding. The schema stores no permanent discovery registry or retailer catalog. Structurally valid prohibited merchants reach genuine deterministic evaluation and are durably rejected with audit evidence. The AI tool/API runtime is not implemented here.
 
 The backend must independently retrieve/validate the selected listing and build an immutable snapshot. AI-supplied prices or merchant names cannot be authoritative financial inputs, even if they resemble external data. A backend re-fetch is independent of AI text, but still does not guarantee the retailer's live checkout price or stock.
 
@@ -199,12 +199,12 @@ Approval must bind to the unchanged purchase snapshot, verified human identity, 
 | Existing dependencies | FastAPI/HTTPX/Pydantic stack plus SQLAlchemy 2.0, psycopg 3, Alembic and argon2-cffi; pytest is a development dependency, with exact resolution in `uv.lock` |
 | Package entry point | `src/agentpal/__init__.py` still contains the starter CLI greeting; it is not completed application orchestration |
 | Agent | PydanticAI planned; no live integration implemented |
-| Product discovery | `scripts/spike_channel3.py` search/retrieve spike passed; not integrated into FastAPI |
+| Product discovery | `channel3.py` fixed-origin search/detail adapter and `discovery.py` bounded transient references/independent comparison implemented offline; no HTTP routes or agent runtime |
 | Payments | `scripts/spike_paypal.py` Vault/Orders spike passed; not integrated into FastAPI |
 | Database | PostgreSQL-native SQL schema, Alembic revisions `0001`–`0002`, SQLAlchemy Core/psycopg connections and database guards implemented; no duplicate ORM schema |
 | Local database setup | Tests start isolated local PostgreSQL clusters; PostgreSQL 18.6 is available and was used. No persistent database or Compose service was provisioned |
 | Owner access | Interactive owner bootstrap and `/auth/login`, `/auth/me`, `/auth/logout` implemented; no public registration |
-| Policy / budget services | Owner-only current/history/configuration and current UTC budget APIs implemented; purchase policy evaluation is not yet integrated |
+| Policy / budget services | Owner-only configuration/history/current UTC budget APIs and reusable deterministic purchase evaluation implemented; no human approval or payment-dispatch service |
 | Frontend | React/TypeScript planned; exact framework OPEN; no integrated AgentPal frontend |
 | Operational UI / analytics | AG Grid planned; AG Studio optional; both require appropriate licensing review |
 | Hosting | Render + Neon previously tentative; hosting is not a binding approved choice and deployment is unverified |
@@ -233,6 +233,9 @@ agentpal/
         ├── __init__.py
         ├── main.py
         ├── policy.py      # owner policy versions and current UTC budget API
+        ├── channel3.py    # bounded provider adapter, exact parsing and comparison
+        ├── discovery.py   # trusted run context, transient registry and service
+        ├── proposals.py   # idempotent immutable proposals and initial rule evaluation
         ├── db/            # explicit PostgreSQL settings and lazy engine factory
         └── auth/          # bootstrap, Argon2id, cookie sessions, CSRF and dependencies
 ```
@@ -373,6 +376,109 @@ configuration or existing test was changed in this task, and prior uncommitted
 authentication work was preserved. No persistent database or external product/
 payment API was accessed; no commit or push occurred.
 
+### Implemented purchase proposals and deterministic initial evaluation
+
+`src/agentpal/proposals.py` now connects Channel3/discovery to the existing
+immutable purchase and audit persistence. No HTTP routes, migrations, dependencies,
+financial defaults or new configuration were added. `ProposalService(engine,
+discovery)` provides synchronous trusted `start_run(owner, agent_id)` and async
+`create(context, offer_ref, quantity)`. `exact_total` and `evaluate_policy` are pure
+helpers over trusted inputs; public output uses frozen `Proposal`/`ProposalResult`
+and an allowlisted `.public()` projection, not raw database/provider records.
+
+The trusted launcher receives an authenticated `OwnerSession` from `OwnerRead`.
+`start_run` rechecks session activity, login and CSRF hash plus agent ownership/
+enabled status, then generates a run UUID. AI tools receive only reference and
+quantity arguments and close over the backend context; no owner/session/agent
+identity is accepted as an AI authorization claim. Direct `RunContext` construction
+is an internal trust boundary, not authentication. Creation/replay rechecks the
+single owner's login and enabled owned agent, and verifies the reference's full
+owner/agent/run binding. No human approval power is granted. Logout does not
+automatically cancel an existing run; the future runtime must dispose its references
+when ending/canceling a run, and must securely restore original run IDs after restart.
+
+Creation checks durable origin identity before needing the volatile registry.
+For a new proposal it resolves the reference and independently retrieves through
+`DiscoveryService.refresh`, requiring unchanged product/domain/URL/condition,
+unique supported USD price (including no decreases) and explicit `InStock`.
+Source failures/changes/ambiguity/unavailability and invalid references are safe
+validation errors, not fake business-policy rejections; they insert no purchase.
+All source I/O occurs outside database transactions. Sync database scopes are
+offloaded from the async event loop.
+
+The short write transaction acquires the existing financial revision/owner lock,
+rechecks agent/context, durable replay and reference validity, reads the latest
+active policy and initializes/reads the current UTC budget period. No active
+policy raises `POLICY_SETUP_REQUIRED`, without a proposal or seeded defaults.
+Available money comes directly from `budget_balances` using PostgreSQL NUMERIC,
+with existing full/partial/extra/foreign capture protection rules unchanged.
+An observed UTC period rollover rolls back with `BUDGET_PERIOD_CHANGED` for safe
+retry. Quantity is a strict positive BIGINT; isolated Decimal precision computes
+the exact total, independently generated again by PostgreSQL.
+
+Deterministic rejection codes are evaluated in stable order: `MERCHANT_NOT_ALLOWED`,
+`HARD_PURCHASE_LIMIT_EXCEEDED`, `INSUFFICIENT_BUDGET`. All failing rejection reasons
+are recorded. Otherwise at/below the automatic threshold returns `AUTO_AUTHORIZED`
+with `AUTO_APPROVAL_THRESHOLD_MET`; above it returns `AWAITING_HUMAN_APPROVAL` with
+`HUMAN_APPROVAL_REQUIRED`. The hard maximum is inclusive, and human approval cannot
+override rejection. Database labels remain unchanged (`rejected`, `auto_authorized`,
+`awaiting_approval`). These are initial decisions only, never payment status or
+guaranteed current execution authority.
+
+Each successful transaction inserts one immutable purchase with verified source
+evidence, exact amounts, evaluated policy, initial decision/reasons and DB-computed
+snapshot hash/expiry. The existing trigger writes `proposal_recorded`; the service
+writes one `proposal_evaluated` agent audit, with evaluation version, context hash,
+original run ID, budget period/observation, exact accounting/total and boolean rule
+trace. Audits contain no raw URLs, provider blobs, descriptions, credentials or
+model explanations. Context binding fits the existing append-only audit table,
+so no schema change is necessary. No human approval, dispatch revalidation,
+reservation, payment or payment operation is inserted. An active UTC period may
+be initialized on demand. Concurrent affordable proposals may both be initially
+eligible; future dispatch must independently refresh and atomically recheck/
+reserve budget. No holds are invented for awaiting or rejected proposals.
+
+The existing unique origin hash and owner lock prevent duplicate proposals. Matching
+reference, owner/agent/run and quantity return the original committed proposal
+before source/registry access, even after registry loss/restart, expiry or policy
+changes. Different quantity conflicts; cross-context replay is rejected first.
+Replays do not extend TTL, duplicate audit events, rewrite snapshots or restart
+financial operations. Expired/stale-policy observation flags accompany the original
+initial decision. Existing rows lacking the service's unique immutable context
+audit cannot be adopted. Original run IDs can be restored from trusted audit data;
+AI-supplied run claims are not a recovery mechanism. Serialization/deadlock/unique-
+origin aborts roll back and check a committed winner; otherwise the caller receives
+`TRANSACTION_CONFLICT` and retries the same request. Deferred failures cannot return
+success. A timed-out/canceled caller must resolve the same reference/quantity before
+assuming an in-progress DB worker failed. New references are distinct proposal
+identities, not proof of safe retry for an uncertain PayPal payment.
+
+The next financial services remain human approval and dispatch: compare independent
+source retrieval against the durable purchase, enforce current policy/original TTL,
+atomically reserve current-period capacity and prepare durable payment recovery
+identity. No such services, PayPal calls, agent or frontend were implemented here.
+Catalog retailers still receive no demo payment: the sole eventual recipient is
+AgentPal's PayPal Sandbox Business account, with no actual retailer fulfillment.
+Channel3 price alias/types, condition/URL stability, shapes/encoding and data-use
+permissions still require separately authorized live verification before judging.
+
+Proposal verification on isolated PostgreSQL 18.6:
+`rtk proxy .venv/bin/pytest -q --tb=line` reported **377 passed, 1 warning in
+61.73 seconds**, preserving all 322 prior tests and adding 55 proposal cases.
+Tests cover actual duplicate/policy/financial-lock concurrency, deferred commit
+serialization/deadlock/storage failures with full rollback and safe retry, registry-
+loss replay, changed-quantity/cross-context rejection, source changes/outages,
+exact large totals, immutable snapshot/audit evidence, expiration, authoritative
+accounting and replay without restarting an uncertain payment. Channel3 responses
+are explicitly synthetic mocked fixtures; no external requests were made. The
+existing Starlette/HTTPX TestClient deprecation warning remains nonblocking.
+Offline wheel/source builds, lockfile validation, syntax and whitespace checks
+passed. All 25 decisions remain verbatim; existing tests, auth/policy/database code,
+migrations, dependencies and config placeholders were unchanged. Previous
+uncommitted discovery work was preserved, with compatible extensions for stable
+reference hashing and restoring immutable offer metadata. No credentials or
+persistent databases were accessed; no commit/push occurred.
+
 ## 8. Channel3 feasibility — completed search and retrieval spike
 
 Evidence is the controlled experiment using `scripts/spike_channel3.py`, as reported by the project owner. The context update inspected the script without running it or contacting Channel3.
@@ -401,7 +507,87 @@ The script's CLI `lookup` command retrieves by product ID; it does not call the 
 
 **Not verified:** Offer-specific stable IDs, retailer checkout prices, multi-merchant PayPal payouts, or real retailer fulfillment.
 
-Channel3 is suitable for discovery and backend product-data refresh within these limits. Selected-offer identity (Section 4) and usable-price/refresh rules (Section 13) remain design blockers; neither is solved merely by a successful product lookup. The simulation disclosure in Section 2 remains mandatory for future demonstrations.
+Channel3 is suitable for discovery and backend product-data refresh within these limits. The following implementation addresses conservative selected-offer mapping and parsing; its live compatibility is not established merely by the earlier successful spike. The simulation disclosure in Section 2 remains mandatory for future demonstrations.
+
+### Implemented discovery and transient-selection foundation
+
+`src/agentpal/channel3.py` implements asynchronous fixed-origin search and product
+retrieval, based on the existing spike's `POST /v1/search` (`products` array) and
+`GET /v1/products/{id}` (root product) mappings and `x-api-key`. Settings read only
+explicit exported `CHANNEL3_API_KEY`, with no dotenv access. There are no new
+HTTP routes, migrations or dependencies. Requests have no retries/redirects/proxies,
+a 45-second total deadline, connect/I/O bounds, 2 MB response cap, at most five
+products and 1,000 offers per product. Identity encoding is requested and compressed
+responses rejected to bound decompression. Bodies, headers and exception details
+never become public errors; only fixed error codes leave the adapter.
+
+Required product fields are `id`, bounded untrusted `title`, and `offers`.
+Each supported offer has a canonical ASCII domain, HTTPS URL fingerprint, optional
+bounded/null condition and valid exact USD price. Prices decode JSON directly
+to Decimal, never through float, and reject fractional cents/invalid/nonfinite/
+negative values. `price.price` and the spike-noted `price.amount` compatibility
+branch are isolated; both must agree if present. Amounts have a computational
+30-integer-digit bound, not a financial policy default. `compare_at_price` is
+ignored. Only exact `InStock` is available; `OutOfStock` is unavailable, all other
+or missing availability unknown. Unavailable/unknown listings can remain visible
+with references, but cannot pass refresh for execution.
+
+All offers are scanned before limiting display to 50 candidates. Same canonical
+domain duplicates are ambiguous even when a duplicate has invalid price or is
+out of stock. Missing/unusable domains reject the entire product, since a hidden
+duplicate cannot be excluded. Duplicate product IDs reject those search products.
+Other malformed offers yield fixed rejection reasons; valid prohibited merchants
+remain available for actual future policy evaluation. No allowlist filter or fake
+rejection exists. Raw URL/description/provider blobs are not tool output. Source
+text is untrusted, and no arbitrary retailer URL is requested.
+
+`src/agentpal/discovery.py` implements frozen trusted `RunContext`, `OfferRegistry`,
+`SelectionEvidence` and `DiscoveryService.search/resolve/refresh`. Trusted callers
+must supply authenticated owner/verified agent identity and backend-created run
+IDs, never deserialize these from AI arguments. No runtime authentication or
+PydanticAI integration is added by this internal Python boundary. References are
+32 random bytes in opaque 43-character URL-safe encoding, stored only as
+purpose-separated SHA-256 hashes bound to owner/agent/run and frozen source evidence.
+Default bounds are 500 global/100 per run with 600-second absolute monotonic TTL;
+lock-protected FIFO eviction, run disposal, restart loss and expired/forged/cross-
+context references fail safely. Reads do not extend TTL. Run one worker; no
+discovery-only persistence or distributed registry exists.
+
+`refresh()` independently retrieves the selected product and compares only its
+original merchant, URL fingerprint, nullable condition, exact USD amount and
+recognized availability. Both increases and decreases block the old selection.
+Changed attribution URLs fail conservatively; title changes alone are not
+identity. Results match existing revalidation vocabulary: passed, identity_changed,
+price_changed, unavailable, ambiguous, unsupported, missing, source_error. A failed
+refresh supplies no fallback evidence. Expiry/eviction during I/O is rechecked.
+The original selection is never rewritten, and no merchant is substituted.
+
+These observations/ref hashes align with existing immutable purchase fields but
+grant no spending authority. The proposal service now independently refreshes,
+evaluates policy/quantity/budget, persists snapshot/origin evidence and enforces
+durable uniqueness. Future dispatch must compare a new retrieval with that durable
+snapshot, independently of transient-registry survival; dispatch remains unimplemented.
+
+Verification uses explicitly synthetic mocked HTTPX fixtures, never real retailer
+data or live calls. The earlier spike does not establish exact price alias/type,
+null condition behavior, URL attribution stability, response-size/encoding behavior
+or provider retention/display permissions. Those remain authorized integration
+checks. Listing price is the approved Sandbox demo basis; source stock and local
+observation timestamps are not retailer guarantees. Catalog retailers still receive
+no PayPal Sandbox demo payment and no actual goods are ordered or fulfilled.
+
+See [README](../README.md#channel3-discovery-and-transient-offer-selection) for the
+call contracts, safe tool output, registry lifecycle, limitations and usage example.
+
+Verification on isolated PostgreSQL 18.6: the complete
+`rtk proxy .venv/bin/pytest -q --tb=line` run reported **322 passed, 1 warning in
+51.53 seconds**, including all 194 prior cases and 128 new discovery/reference
+cases. The existing Starlette/HTTPX TestClient deprecation warning remains.
+Offline source/wheel builds, locked dependency validation, Python syntax and
+whitespace checks passed. All 25 decisions remain verbatim; existing code/tests,
+dependencies, migrations and configuration placeholders were unchanged. No real
+credential files, persistent databases or external APIs were accessed. No commit
+or push occurred.
 
 ## 9. PayPal Sandbox feasibility and credential hygiene
 
@@ -476,7 +662,7 @@ Historical schedule context: submissions opened October 1, 2026, at 9:15 AM PT; 
 | PayPal OAuth / Vault / zero-click / repeated request ID | **PASSED, separate spike:** Section 9 |
 | PayPal secret rotation / revocation / OAuth retest | **COMPLETED:** Section 9 |
 | Channel3 discovery and product-detail retrieval | **PASSED, separate spike:** Section 8 |
-| Channel3 safe selected-offer mapping and usable-price policy | **OPEN design:** Sections 4 and 13 |
+| Channel3 safe selected-offer mapping and usable-price policy | **IMPLEMENTED offline:** bounded adapter, exact prices, conservative comparison and transient references; live compatibility/permissions still unverified |
 | AG Studio install, custom data, grid, Edit Mode, charts, persistence | **PASSED, separate spike:** Section 10 |
 | AG Studio AI Assistant / judging license | **UNCONFIRMED / UNRESOLVED** |
 | FastAPI app metadata and `GET /health` | **IMPLEMENTED; prior import/TestClient verification passed** |
@@ -484,9 +670,10 @@ Historical schedule context: submissions opened October 1, 2026, at 9:15 AM PT; 
 | Single-owner authentication | **IMPLEMENTED:** secure bootstrap, Argon2id login, durable sessions/revocation, CSRF and reusable owner dependencies |
 | Vault onboarding in app | **NOT IMPLEMENTED** |
 | Owner policy configuration/history and current-month budget API | **IMPLEMENTED:** authenticated, CSRF-protected writes, immutable versions and atomic immediate limits under Decision 25 |
-| Purchase policy evaluation and approval API/services | **NOT IMPLEMENTED**; their persistence and final financial integrity guards are implemented |
+| Purchase proposals and initial deterministic policy evaluation | **IMPLEMENTED:** independent refresh, immutable decisions/rule traces, exact totals and context-bound durable idempotency; no HTTP routes |
+| Human approval and reservation/payment dispatch services | **NOT IMPLEMENTED**; persistence and final financial integrity guards are implemented |
 | Database idempotency, accounting and retry guards | **IMPLEMENTED**; HTTP/provider orchestration and reconciliation services are **NOT IMPLEMENTED** |
-| Live PydanticAI / Channel3 / PayPal application integration | **NOT IMPLEMENTED** |
+| Live PydanticAI / Channel3 / PayPal application integration | Reusable Channel3 adapter implemented but not called live in this task; agent/HTTP orchestration and PayPal integration **NOT IMPLEMENTED** |
 | Integrated frontend / end-to-end AgentPal execution / judge-ready demo | **NOT COMPLETED** |
 | PayPal webhooks | **EXCLUDED from MVP**, not a pending integration milestone |
 
@@ -500,15 +687,15 @@ These are unresolved integration/configuration choices; approved requirements in
 
 | OPEN question | What must be resolved |
 |---|---|
-| Selected-offer adapter evidence | Transient references and restricted product/domain uniqueness are approved; verify URL/condition behavior and source matching using sanitized fixtures |
+| Selected-offer adapter evidence | Conservative product/domain/URL/condition matching is implemented with synthetic fixtures; verify actual attribution stability, null condition behavior, price aliases and supported shapes before live integration |
 | Source data retention | Necessary purchase evidence is implemented; Channel3 retention/display permissions still require review before ingestion |
-| Source adapter implementation | Latest successful listing retrieval and recognized availability are approved; `InStock` is observed. Implement parsing/retrieval, material-change handling and clear failures without retailer guarantees |
+| Source adapter integration | Parsing/retrieval/comparison and independent proposal refresh implemented offline; live adapter verification, runtime identity integration and pre-dispatch refresh remain pending |
 | Channel3 access and data-use restrictions | API availability for the demo/judging, terms, caching, public redistribution, benchmark/evaluation use |
 | Owner deployment and recovery | Authentication and configurable lifetime are implemented; select deployment settings/safe judge access and define owner recovery separately; no public registration |
 | Vault onboarding persistence | Setup/callback correlation and validation, verified completion, retries/cancellation, secure payment-method storage |
 | Owner-selected financial values | The configuration API and validation are implemented; the owner must supply actual deployment budget/threshold/hard-limit values, with no seeded defaults |
 | Proposal TTL | The owner supplies a valid duration through the API; one TTL begins at proposal creation and existing snapshots cannot be extended |
-| Transactional services | Database guards and concurrency tests exist; implement idempotent callers, consistent lock acquisition, retries after transaction abort and verified reconciliation evidence |
+| Transactional services | Idempotent proposal caller, consistent owner locks and safe conflict handling implemented; human approval, dispatch and verified reconciliation orchestration remain pending |
 | Monthly configuration actions | RESOLVED by Decision 25 and the API: immediate atomic current-month limits; reservations bind at reservation time and never move |
 | Policy/pricing/dispatch race | Policy activation versus database dispatch claims is serialized; independent source refresh and actual HTTP dispatch/recovery still require service implementation |
 | PayPal idempotency | Endpoint-specific documented retention, replay eligibility and exact payload persistence; safe reconciliation/manual review when replay is unavailable, including no known order ID |
@@ -516,17 +703,17 @@ These are unresolved integration/configuration choices; approved requirements in
 | Financial edge behavior | Exact cent storage and schema/migrations are implemented. Decide zero-value provider execution behavior; preserve unexpected higher-precision provider facts for review |
 | AG Grid / AG Studio | Applicable feature/edition and judging/deployment licenses; optional Studio AI feasibility and unresolved assistant error |
 
-## 14. Roadmap after persistence, authentication and policy/budget APIs
+## 14. Roadmap after persistence, authentication, policy and discovery foundations
 
-Context consolidation, all 25 decisions, PostgreSQL persistence/hardening, single-owner authentication and owner policy/budget APIs are complete. Do not repeat bootstrap, login/configuration API implementation, completed feasibility spikes, or a blank schema-planning phase. Review existing guards/dependencies and their integration limitations before the next bounded task.
+Context consolidation, all 25 decisions, PostgreSQL persistence/hardening, single-owner authentication, owner policy/budget APIs, the offline-tested Channel3 foundation and idempotent initial proposal evaluation are complete. Do not repeat those implementations, completed feasibility spikes or blank schema/adapter planning. Review existing guards/dependencies and their integration limitations before the next bounded task.
 
-1. Implement the bounded Channel3 selected-offer adapter/transient references, first verifying source matching with sanitized fixtures and data-use permissions.
-2. Implement idempotent proposal evaluation using the configured policy and immutable snapshots.
-3. Implement verified owner approval and Vault onboarding, including callback validation and external encryption-key provisioning.
+1. Verify real Channel3 adapter compatibility and data-use permissions in a separately authorized bounded check; offline fixtures do not establish live compatibility.
+2. Implement verified owner approval for the unchanged purchase snapshot/original TTL, with current policy, session and CSRF checks.
+3. Implement Vault onboarding, including callback validation and external encryption-key provisioning.
 4. Build durable payment/reconciliation services around existing database guards. Verify endpoint replay retention and exact payload recovery before any authorized payment test.
 5. Integrate PydanticAI and the frontend; verify end-to-end execution and prepare the public licensed source, setup/judging access and concise English demonstration.
 
-The implemented persistence, authentication and owner configuration APIs do not implement source retrieval, purchase evaluation/approval endpoints, checkout, payment execution, a frontend or an end-to-end purchasing system.
+The implemented foundations include reusable source retrieval and durable initial proposal evaluation, but no discovery HTTP/AI runtime, purchase/human-approval endpoints, checkout, payment execution, frontend or end-to-end purchasing system.
 
 ---
 
