@@ -1,10 +1,11 @@
 # AgentPal — Full Project Context & Progress Handoff
 
 **Last updated:** 2026-10-21  
-**Status:** PayPal/Channel3 feasibility and the FastAPI foundation passed. PostgreSQL persistence is implemented with native SQL definitions, Alembic migrations, SQLAlchemy/psycopg configuration and disposable PostgreSQL integration tests. Application policy/authentication/agent/payment services and end-to-end execution remain unimplemented.  
+**Status:** PayPal/Channel3 feasibility and the FastAPI foundation passed. PostgreSQL persistence, single-owner authentication and authenticated policy/monthly-budget APIs are implemented, including immediate current-month budget changes under approved Decision 25. Purchase evaluation, agent/payment integrations and end-to-end execution remain unimplemented.
+
 **Purpose:** The single authoritative project context for the existing AgentPal repository.
 
-> **Authority and scope:** Sections 1–14 describe the current requirements, evidence, open questions, and roadmap. Section 3, **Approved MVP Decisions**, records all 24 owner-approved decisions and supersedes earlier proposals. Appendix A preserves historical evidence only; its commands, temporary code, old plans, and statuses are not current implementation instructions. Spike-script comments can also predate completed experiments and approved scope. This context does not authorize implementation of every planned feature.
+> **Authority and scope:** Sections 1–14 describe the current requirements, evidence, open questions, and roadmap. Section 3, **Approved MVP Decisions**, records all 25 owner-approved decisions and supersedes earlier proposals. Appendix A preserves historical evidence only; its commands, temporary code, old plans, and statuses are not current implementation instructions. Spike-script comments can also predate completed experiments and approved scope. This context does not authorize implementation of every planned feature.
 
 ## 1. Operating instructions for assistants / Codex
 
@@ -35,7 +36,7 @@ A functional, reproducible end-to-end application and a public English YouTube d
 
 ## 3. Approved MVP Decisions
 
-All 24 decisions below are **confirmed requirements**, not proposals. Decisions 22–24 were approved in the subsequent persistence implementation request. Remaining integration/configuration choices are collected in Section 13.
+All 25 decisions below are **confirmed requirements**, not proposals. Decisions 22–24 were approved in the persistence implementation request; Decision 25 was approved in the authenticated policy/budget API request and supersedes earlier open budget-adjustment questions. Remaining integration/configuration choices are collected in Section 13.
 
 ### Decision 1 — Single PayPal Sandbox Business Account
 
@@ -149,6 +150,22 @@ The latest successfully retrieved Channel3 listing price is the approved applica
 
 Execution requires an independently observed, explicitly recognized available status; the initial spike observed `InStock`. Unknown, missing, unavailable and unsupported statuses cannot count as available. A failed refresh cannot authorize payment using stored price/availability. Explain failures and permit fresh discovery without substituting an offer or transferring its approval. Source-reported availability does not guarantee physical retailer stock.
 
+### Decision 25 — Immediate Monthly Budget Updates
+
+Changes to the configured monthly spending budget take effect immediately for the
+current UTC accounting month and establish the configured base for future months.
+An increase updates the effective current-month limit immediately. A decrease
+must not undercut confirmed spending plus outstanding financial protection.
+Rejected decreases must not partially alter the active policy or budget. Policy
+and budget changes must be attributable to the authenticated human owner and
+audited. Preserve immutable policy/purchase evidence, historical periods, initial
+limits, confirmed captures, reservations and original payment/reservation periods.
+Future months initialize from the latest active policy; previous-period unresolved
+work stays in its original period. UTC calendar boundaries and no rollover remain
+unchanged. For example, with $400 in spending/protection, a $1,000 limit may rise
+to $1,500 or fall to $500, but cannot fall to $300. These numbers illustrate the
+approved behavior and are not application defaults.
+
 ## 4. Trust boundaries, purchase intent, and selected-offer identity
 
 | Layer | Responsibility | Boundary |
@@ -179,19 +196,20 @@ Approval must bind to the unchanged purchase snapshot, verified human identity, 
 | Backend | FastAPI in existing `src/agentpal/` package |
 | Bootstrap | `src/agentpal/main.py`: `FastAPI(title="AgentPal API", version="0.1.0")`; `GET /health` returns `{"status":"ok"}` |
 | Packaging | `pyproject.toml`: project version `0.1.0`, Python `>=3.12`, uv build backend; `uv.lock` present |
-| Existing dependencies | FastAPI/HTTPX/Pydantic stack plus SQLAlchemy 2.0, psycopg 3 and Alembic; pytest is a development dependency, with exact resolution in `uv.lock` |
+| Existing dependencies | FastAPI/HTTPX/Pydantic stack plus SQLAlchemy 2.0, psycopg 3, Alembic and argon2-cffi; pytest is a development dependency, with exact resolution in `uv.lock` |
 | Package entry point | `src/agentpal/__init__.py` still contains the starter CLI greeting; it is not completed application orchestration |
 | Agent | PydanticAI planned; no live integration implemented |
 | Product discovery | `scripts/spike_channel3.py` search/retrieve spike passed; not integrated into FastAPI |
 | Payments | `scripts/spike_paypal.py` Vault/Orders spike passed; not integrated into FastAPI |
 | Database | PostgreSQL-native SQL schema, Alembic revisions `0001`–`0002`, SQLAlchemy Core/psycopg connections and database guards implemented; no duplicate ORM schema |
 | Local database setup | Tests start isolated local PostgreSQL clusters; PostgreSQL 18.6 is available and was used. No persistent database or Compose service was provisioned |
-| Owner access / policy / budget services | Required, not implemented |
+| Owner access | Interactive owner bootstrap and `/auth/login`, `/auth/me`, `/auth/logout` implemented; no public registration |
+| Policy / budget services | Owner-only current/history/configuration and current UTC budget APIs implemented; purchase policy evaluation is not yet integrated |
 | Frontend | React/TypeScript planned; exact framework OPEN; no integrated AgentPal frontend |
 | Operational UI / analytics | AG Grid planned; AG Studio optional; both require appropriate licensing review |
 | Hosting | Render + Neon previously tentative; hosting is not a binding approved choice and deployment is unverified |
 
-Repository layout after persistence implementation (credential files omitted):
+Repository layout after persistence and authentication implementation (credential files omitted):
 
 ```text
 agentpal/
@@ -214,7 +232,9 @@ agentpal/
     └── agentpal/
         ├── __init__.py
         ├── main.py
-        └── db/            # explicit PostgreSQL settings and lazy engine factory
+        ├── policy.py      # owner policy versions and current UTC budget API
+        ├── db/            # explicit PostgreSQL settings and lazy engine factory
+        └── auth/          # bootstrap, Argon2id, cookie sessions, CSRF and dependencies
 ```
 
 The context review read `pyproject.toml`, both package files, both spike scripts, `.env.example`, and `.gitignore`. The environment example contains PayPal placeholders and `CHANNEL3_API_KEY`; the ignore file excludes `.env`, `.venv/`, `__pycache__/`, `node_modules/`, and `dist/`, among other entries. No credential file was read and no spike was executed. At review start, `git status --short` showed the project files/directories as untracked; no commit or push was performed.
@@ -247,9 +267,111 @@ Implemented responsibilities: one owner and hashed session/CSRF persistence; age
 
 Key database guarantees: exact USD amounts without silent fractional-cent rounding; generated purchase totals; unique proposal origin; policy/TTL/snapshot/session bindings; concurrency-safe monthly creation and reservation accounting; operation-bound source checks requiring `InStock`; exclusive in-flight dispatch claims; immutable request identity/payload and conditional replay windows; evidence-bound failure/release; full-capture settlement and preservation of unexpected provider facts. Unexpected USD captures can resolve through a distinct, authenticated owner-reviewed reconciliation outcome without claiming full success. Actual captured spending may expose overspending and is never concealed to satisfy an authorization limit.
 
-Reservations bind to the current UTC period when created, and original-period attribution remains unchanged during late reconciliation. A single matching full USD capture replaces its held amount in the derived balance immediately, even if status/settlement commits later; partial, extra or conflicting captures retain conservative protection while unresolved. Period initial limits are preserved; explicit limit adjustments are separately auditable and reductions cannot undercut confirmed spending plus outstanding protection. Whether owner policy configuration automatically requests a current-period adjustment remains OPEN. A possibly dispatched reservation cannot be released on proposal expiry. Closed/stopped payments cannot re-enter execution; review closure needs fresh reconciliation evidence, and unresolved operations/capture facts block additional POST execution.
+Reservations bind to the current UTC period when created, and original-period attribution remains unchanged during late reconciliation. A single matching full USD capture replaces its held amount in the derived balance immediately, even if status/settlement commits later; partial, extra or conflicting captures retain conservative protection while unresolved. Period initial limits are preserved; explicit limit adjustments are separately auditable and reductions cannot undercut confirmed spending plus outstanding protection. Decision 25 and the owner API now atomically couple configured monthly-budget changes to the current period's effective limit. A possibly dispatched reservation cannot be released on proposal expiry. Closed/stopped payments cannot re-enter execution; review closure needs fresh reconciliation evidence, and unresolved operations/capture facts block additional POST execution.
 
 Database guards are necessary integrity checks, not complete business integrations. Future trusted services must authenticate human sessions/CSRF, independently retrieve/interpret Channel3 and PayPal evidence, encrypt private references/payloads, sanitize JSON, supply rule explanations, acquire consistent locks and recover interrupted operations. The database cannot establish source freshness, cookie authenticity or cryptographic correctness of supplied ciphertext. Financial policy values, encryption/key provisioning, password recovery and endpoint-specific PayPal replay evidence are not invented or seeded.
+
+### Implemented single-owner authentication foundation
+
+`src/agentpal/auth/` implements an interactive `agentpal-bootstrap` command with
+hidden confirmed password entry and no password arguments/defaults. Argon2id uses
+the RFC 9106 low-memory profile; duplicate/racing bootstrap attempts preserve the
+existing owner. No financial configuration is seeded and migrations remain at
+`0002`. No persistent database was accessed or owner provisioned during this task.
+
+FastAPI exposes `POST /auth/login`, `GET /auth/me` and `POST /auth/logout`. Random
+32-byte session/CSRF tokens are stored only as purpose-separated SHA-256 hashes
+in the existing `owner_sessions` table. Session cookies are HttpOnly, host-only,
+SameSite=Strict and Secure with `__Host-` names by default; explicit HTTP loopback
+development uses distinct names. Absolute expiry defaults to eight hours and is
+configurable from one minute to one day, without sliding renewal. Revocation and
+expiry are checked from PostgreSQL; sessions survive backend restarts. Session
+creation/revocation are audited without raw tokens, and re-login rotates the
+current browser session. Login errors are generic and malformed requests do not
+echo credentials. Owner info returns only the login name.
+
+The CSRF cookie is intentionally readable by same-origin frontend code and must
+be supplied as `X-CSRF-Token`; its stored hash binds it to the active session.
+Logout and future owner writes also require the configured exact Origin or a
+same-origin Referer. Cross-site/same-site Fetch Metadata is rejected; no CORS is
+enabled. Inactive-session logout clears stale cookies with 204 without granting
+owner authority; protected writes reject inactive sessions. The bounded login
+limiter defaults to five attempts per minute globally across names/IPs, with two
+concurrent Argon2 slots; admission counters reset on restart and require one
+backend worker. They do not replace durable session storage.
+
+Future financial reads should use `OwnerRead`; sensitive writes should use
+`OwnerWrite` from `agentpal.auth.api`, its transaction connection and its verified
+session ID for approval/audit attribution. The write dependency locks owner then
+session, validates CSRF, rolls back errors and commits before returning a response.
+Do not pass owner cookies, credentials or HTTP clients to agent tools. Agent IDs
+and claimed roles cannot confer owner authority; stolen owner credentials still
+represent a browser/credential compromise, not proof of physical human presence.
+Password recovery, MFA, frontend/XSS defenses and deployment hardening remain
+outside this slice. See [README](../README.md#single-owner-authentication) for
+configuration, secure bootstrap and interactive login/logout verification.
+
+Authentication verification on PostgreSQL 18.6: **132 tests passed**, including
+44 authentication/HTTP/Argon2id cases and all 88 existing persistence cases.
+Package source/wheel builds, locked dependency validation and the installed
+bootstrap help entry point passed. The existing Starlette HTTPX TestClient
+deprecation warning remains nonblocking. No credential files, external product
+or payment APIs, or persistent user databases were accessed; no commit/push occurred.
+
+### Implemented owner policy and budget APIs
+
+`src/agentpal/policy.py` adds owner-only `GET /policy`, full-replacement
+`PUT /policy`, paginated `GET /policy/history`, and `GET /budget/current`.
+Writes reuse `OwnerWrite` and its verified session/CSRF/transaction connection;
+reads reuse `OwnerRead`. The budget read rechecks the session under owner/session
+locks before on-demand period initialization. Uploads are bounded and parsed before
+financial row locks. No new tables, migrations, dependencies or configuration were
+needed; existing authentication work and financial guards remain in place.
+
+All five settings are explicitly supplied, with no seeded financial defaults.
+Money inputs are exact nonnegative decimal strings with at most two fractional
+digits; JSON money numbers are rejected. TTL is a positive integer within the
+database/Python timestamp representation, auto-approval cannot exceed the hard
+limit, and the canonical PostgreSQL allowlist validator rejects malformed,
+uppercase, duplicate or ambiguous domain forms. The allowlist can be empty.
+Fresh owners receive 409 `policy_setup_required` until their initial PUT.
+
+Each actual configuration change inserts an immutable policy version and updates
+the active pointer, the current effective monthly limit and a human-attributed
+audit event in one short transaction. The old month base remains in
+`initial_limit`/`initial_policy_id`; existing period bindings and purchase snapshots
+are not rewritten. Budget decreases below spend/protection return 409
+`budget_conflict` without partial state. Required nullable `expected_policy_id`
+prevents lost updates: use null for initial setup and the active UUID thereafter.
+Identical configuration/effective-limit requests are no-ops, including an exact
+retry after success, so retries do not create duplicate versions/audits.
+Different stale replacements receive 409 `policy_conflict`. PostgreSQL deadlock
+or serialization aborts, including commit-time aborts, return 409
+`transaction_conflict` after full rollback; the client can refresh and retry the
+same request. No automatic financial HTTP retry is implemented.
+
+Current-budget amounts come from `agentpal.budget_balances`; available is computed
+with PostgreSQL NUMERIC and can be negative. UTC boundaries, reset time, effective
+and initial limit, active policy ID, spending/protection and summary review/foreign
+capture counts are returned without session secrets. Full captures are not counted
+twice; unexpected provider precision/results remain visible. Policy changes
+invalidate old unexecuted proposals through existing guards, while dispatched and
+uncertain reservations retain their original protection and recovery identity.
+This API does not evaluate new purchases, execute payments or reconcile them.
+
+Final policy/budget verification on isolated PostgreSQL 18.6:
+`rtk proxy .venv/bin/pytest -q --tb=line` reported **194 passed in 50.61 seconds**,
+including all 132 previous cases plus 62 policy/budget cases. Tests exercise real
+database concurrency, deferred commit-time serialization rollback and safe retry,
+UTC period initialization/renewal, original-period exposure, large exact amounts,
+policy invalidation and policy/reservation/dispatch/capture/revocation races.
+The renewal test advances only the initializer's month clock in a disposable test
+database; production has no clock override. Package builds, lockfile, syntax and
+whitespace checks passed; the existing TestClient deprecation warning remains.
+Decisions 1–24 remain verbatim. No financial migration, dependency, environment
+configuration or existing test was changed in this task, and prior uncommitted
+authentication work was preserved. No persistent database or external product/
+payment API was accessed; no commit or push occurred.
 
 ## 8. Channel3 feasibility — completed search and retrieval spike
 
@@ -350,7 +472,7 @@ Historical schedule context: submissions opened October 1, 2026, at 9:15 AM PT; 
 
 | Area | Current status |
 |---|---|
-| All 24 architectural decisions | **APPROVED:** Section 3 |
+| All 25 architectural decisions | **APPROVED:** Section 3 |
 | PayPal OAuth / Vault / zero-click / repeated request ID | **PASSED, separate spike:** Section 9 |
 | PayPal secret rotation / revocation / OAuth retest | **COMPLETED:** Section 9 |
 | Channel3 discovery and product-detail retrieval | **PASSED, separate spike:** Section 8 |
@@ -359,8 +481,10 @@ Historical schedule context: submissions opened October 1, 2026, at 9:15 AM PT; 
 | AG Studio AI Assistant / judging license | **UNCONFIRMED / UNRESOLVED** |
 | FastAPI app metadata and `GET /health` | **IMPLEMENTED; prior import/TestClient verification passed** |
 | PostgreSQL persistence / migrations / invariant tests | **IMPLEMENTED:** native SQL/Alembic, disposable PostgreSQL integration/concurrency tests; no persistent database provisioned |
-| Owner authentication / Vault onboarding in app | **NOT IMPLEMENTED** |
-| Policy, approval and budget API/services | **NOT IMPLEMENTED**; their persistence and final financial integrity guards are implemented |
+| Single-owner authentication | **IMPLEMENTED:** secure bootstrap, Argon2id login, durable sessions/revocation, CSRF and reusable owner dependencies |
+| Vault onboarding in app | **NOT IMPLEMENTED** |
+| Owner policy configuration/history and current-month budget API | **IMPLEMENTED:** authenticated, CSRF-protected writes, immutable versions and atomic immediate limits under Decision 25 |
+| Purchase policy evaluation and approval API/services | **NOT IMPLEMENTED**; their persistence and final financial integrity guards are implemented |
 | Database idempotency, accounting and retry guards | **IMPLEMENTED**; HTTP/provider orchestration and reconciliation services are **NOT IMPLEMENTED** |
 | Live PydanticAI / Channel3 / PayPal application integration | **NOT IMPLEMENTED** |
 | Integrated frontend / end-to-end AgentPal execution / judge-ready demo | **NOT COMPLETED** |
@@ -380,30 +504,29 @@ These are unresolved integration/configuration choices; approved requirements in
 | Source data retention | Necessary purchase evidence is implemented; Channel3 retention/display permissions still require review before ingestion |
 | Source adapter implementation | Latest successful listing retrieval and recognized availability are approved; `InStock` is observed. Implement parsing/retrieval, material-change handling and clear failures without retailer guarantees |
 | Channel3 access and data-use restrictions | API availability for the demo/judging, terms, caching, public redistribution, benchmark/evaluation use |
-| Owner sessions and recovery | Session persistence/lifetime/invalidation, password hashing configuration, password reset/recovery and safe judge access; no public registration |
+| Owner deployment and recovery | Authentication and configurable lifetime are implemented; select deployment settings/safe judge access and define owner recovery separately; no public registration |
 | Vault onboarding persistence | Setup/callback correlation and validation, verified completion, retries/cancellation, secure payment-method storage |
-| Budget configuration | Exact base monthly default amount, owner configuration behavior and effect of limit changes; threshold/hard-limit defaults and validation |
-| Proposal TTL | Exact default duration, owner configuration and effect on existing proposals; one duration still begins at proposal creation |
+| Owner-selected financial values | The configuration API and validation are implemented; the owner must supply actual deployment budget/threshold/hard-limit values, with no seeded defaults |
+| Proposal TTL | The owner supplies a valid duration through the API; one TTL begins at proposal creation and existing snapshots cannot be extended |
 | Transactional services | Database guards and concurrency tests exist; implement idempotent callers, consistent lock acquisition, retries after transaction abort and verified reconciliation evidence |
-| Monthly configuration actions | Reservations bind at reservation time and never move. Decide how an owner policy change applies an explicit current-period limit adjustment |
-| Policy/pricing/dispatch race | Atomic boundary for policy invalidation, price revalidation and entering dispatch; no silent snapshot mutation |
+| Monthly configuration actions | RESOLVED by Decision 25 and the API: immediate atomic current-month limits; reservations bind at reservation time and never move |
+| Policy/pricing/dispatch race | Policy activation versus database dispatch claims is serialized; independent source refresh and actual HTTP dispatch/recovery still require service implementation |
 | PayPal idempotency | Endpoint-specific documented retention, replay eligibility and exact payload persistence; safe reconciliation/manual review when replay is unavailable, including no known order ID |
 | Payment state and evidence | Final transitions, reconciliation procedure, full-capture verification and unexpected partial/extra capture accounting |
 | Financial edge behavior | Exact cent storage and schema/migrations are implemented. Decide zero-value provider execution behavior; preserve unexpected higher-precision provider facts for review |
 | AG Grid / AG Studio | Applicable feature/edition and judging/deployment licenses; optional Studio AI feasibility and unresolved assistant error |
 
-## 14. Roadmap after persistence implementation
+## 14. Roadmap after persistence, authentication and policy/budget APIs
 
-Context consolidation, decisions 22–24 and the initial PostgreSQL persistence task are complete. Do not repeat bootstrap, completed feasibility spikes, or a blank schema-planning phase. Review the implemented database layer and its integration limitations before the next bounded task.
+Context consolidation, all 25 decisions, PostgreSQL persistence/hardening, single-owner authentication and owner policy/budget APIs are complete. Do not repeat bootstrap, login/configuration API implementation, completed feasibility spikes, or a blank schema-planning phase. Review existing guards/dependencies and their integration limitations before the next bounded task.
 
-1. Implement owner bootstrap and a secure login/session slice without public registration; authenticate future sensitive policy/approval operations.
-2. Add explicit owner policy configuration and on-demand period usage, choosing current-period adjustment behavior without financial defaults.
-3. Implement Channel3 adapter/transient references and idempotent proposal evaluation against immutable snapshots. Verify source matching fixtures and data-use permissions.
-4. Implement verified owner approval and Vault onboarding, including callback validation and external encryption-key provisioning.
-5. Build durable payment/reconciliation services around existing database guards. Verify endpoint replay retention and exact payload recovery before any authorized payment test.
-6. Integrate PydanticAI and the frontend; verify end-to-end execution and prepare the public licensed source, setup/judging access and concise English demonstration.
+1. Implement the bounded Channel3 selected-offer adapter/transient references, first verifying source matching with sanitized fixtures and data-use permissions.
+2. Implement idempotent proposal evaluation using the configured policy and immutable snapshots.
+3. Implement verified owner approval and Vault onboarding, including callback validation and external encryption-key provisioning.
+4. Build durable payment/reconciliation services around existing database guards. Verify endpoint replay retention and exact payload recovery before any authorized payment test.
+5. Integrate PydanticAI and the frontend; verify end-to-end execution and prepare the public licensed source, setup/judging access and concise English demonstration.
 
-The persistence task does not implement login, source retrieval, policy APIs, checkout, payment execution, a frontend or an end-to-end purchasing system.
+The implemented persistence, authentication and owner configuration APIs do not implement source retrieval, purchase evaluation/approval endpoints, checkout, payment execution, a frontend or an end-to-end purchasing system.
 
 ---
 

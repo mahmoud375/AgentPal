@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.13,<2",
+    "argon2-cffi>=25.1,<26",
     "fastapi>=0.156.1",
     "httpx>=0.28.1",
     "psycopg[binary]>=3.2,<4",
@@ -21,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 agentpal = "agentpal:main"
+agentpal-bootstrap = "agentpal.auth.bootstrap:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]
