@@ -6,7 +6,8 @@ single demo Business account. The application does not order or fulfill goods
 from those retailers. The FastAPI health endpoint, PostgreSQL persistence and
 single-owner authentication, owner policy/budget APIs and a reusable Channel3
 discovery/transient-selection foundation and durable initial purchase proposals
-are implemented. Human approval, reservations and payment execution services are pending.
+and secure owner purchase approval are implemented. Reservation and payment
+execution services are pending.
 
 The [authoritative context](docs/AgentPal_Full_Context_Handoff.md) records approved
 decisions, completed experiments and remaining integration work.
@@ -314,7 +315,7 @@ is already committing, it must retry the same reference/quantity to discover the
 durable outcome. A fresh reference creates a new proposal identity and proves
 nothing about recovery or replay of an uncertain PayPal payment.
 
-Remaining work includes authenticated human approval, pre-dispatch source refresh,
+Remaining work includes pre-dispatch source refresh,
 final atomic financial eligibility/reservation, Vault setup and durable payment/
 reconciliation orchestration. No PayPal API is called here. Eventual payments go
 to **AgentPal's single PayPal Sandbox Business account**, not the catalog retailer;
@@ -322,6 +323,126 @@ there is no retailer checkout, guaranteed stock or goods fulfillment. Before
 end-to-end judging, the previously documented live Channel3 price aliases, optional
 condition, URL stability, supported shapes/encoding and data-use permissions still
 need authorized verification; offline synthetic tests do not establish them.
+
+## Human purchase approval and owner inspection
+
+`agentpal.approvals` exposes the minimum owner-only workflow for immutable purchase
+proposals. All routes require the existing active owner cookie. Writes also require
+the trusted exact Origin (or same-origin Referer) and session-bound `X-CSRF-Token`.
+Agent bearer tokens, claimed roles and owner/agent/session headers provide no
+authority. Owner credentials and HTTP clients must never become AI tool inputs.
+Authentication proves credential possession; it cannot establish physical human
+presence after a browser/credential compromise.
+
+| Endpoint | Contract |
+|---|---|
+| `GET /purchases/approval-queue?limit=20&offset=0` | Current-policy, unexpired, undispatched proposals initially awaiting approval with no recorded human decision. Limit 1–100, offset 0–10,000, newest creation/UUID first; returns `items`, `limit`, `offset`, `has_more` |
+| `GET /purchases/{id}` | Safe immutable proposal details, evaluated policy, original expiry, snapshot binding, human decision and current observed eligibility/payment state; 404 for an unknown ID |
+| `PUT /purchases/{id}/approval` | JSON `decision` (`APPROVE` or `DENY`), required 64-character lowercase hexadecimal `snapshot_hash` and integer `snapshot_hash_version: 1`; returns `purchase` and `replayed` |
+
+Use the snapshot binding returned by GET after inspecting the exact product,
+merchant, condition, unit price, quantity, total, evaluated policy and expiry.
+Unknown fields (including owner/session IDs or replacement prices), duplicate JSON
+keys and malformed decisions are rejected. Bodies are limited to 2 KiB and fully
+parsed/authenticated before financial locks; session/origin/CSRF are checked again
+by `OwnerWrite` before mutation. Responses are `no-store`/`nosniff`. Titles and
+source condition remain untrusted display text; a dashboard must escape them as
+text and never execute merchant instructions or markup.
+
+The response deliberately separates `initial_decision`, nullable `human_decision`,
+`eligibility` and `payment_status`. Monetary values are exact decimal strings;
+timestamps are UTC. `human_decision` contains only decision and time, with no session
+ID. Raw attributed URLs, URL fingerprints, origin-reference hashes, run IDs,
+provider order/Vault references, credentials and arbitrary audit/provider JSON are
+omitted. The snapshot hash is an owner-visible concurrency binding, not a secret
+or an authorization credential. The evaluated policy is the immutable original
+version with its current active flag, never a replacement of that snapshot.
+
+Only proposals initially `AWAITING_HUMAN_APPROVAL` can receive a new decision.
+Both approval and denial require the unchanged snapshot, original unexpired TTL,
+current policy and no dispatch. Rejected and auto-authorized proposals cannot
+receive human decisions. Approval additionally refuses disallowed merchants,
+hard-limit violations, known invalidated offers and currently insufficient budget.
+Denial can still record refusal when those financial/source conditions block
+approval, but cannot change an expired, policy-invalidated or dispatched proposal.
+Expired/stale proposals leave the queue and remain inspectable by ID. A new
+proposal is required to obtain fresh consent for a changed or expired snapshot.
+
+Current budget uses the same `budget_balances` NUMERIC accounting as the budget API.
+If the current month has no period row, its observation uses the configured active
+monthly base with no current-month spend/protection; these read/decision endpoints
+do not initialize budget periods. A reservation already attached to a purchase is
+not charged against available funds twice in the inspection projection. Approval
+does not reserve money or guarantee future availability. The future dispatch gate
+must independently refresh Channel3, verify current policy/TTL/approval and atomically
+reserve/recheck finances before preparing a payment.
+
+`eligibility.can_approve`/`can_deny` describe new human decisions at observation time.
+Reason codes identify known blockers, including expiry, stale policy, rejection,
+denial, dispatch, merchant/hard-limit/budget violations and invalidated source evidence.
+`APPROVED_PENDING_DISPATCH_CHECKS` means consent is recorded; `execution_ready` remains
+false. `payment_status` comes only from the separate payment record, or `NOT_STARTED`.
+An approved unpaid proposal is never labeled purchased/completed. This slice never
+creates a reservation, payment, payment operation or provider request, and never
+releases or changes existing financial protection.
+
+One immutable approval/denial row binds the actual authenticated owner session to
+the stored snapshot. The existing database trigger emits one owner-attributed
+`human_decision_recorded` audit. Matching repeated requests return the first decision
+with `replayed: true`, including after policy changes/expiry; that is historical
+replay, not fresh authorization. The first deciding session/time remain unchanged.
+An opposite decision or stale hash returns 409 instead of overwriting evidence.
+There is no approval withdrawal/reversal flow. Replaying a dispatched/uncertain
+purchase does not restart it, release protection or permit replacement payment.
+
+Writes reuse owner → session locking and the financial revision update, serializing
+with logout, policy changes and other compliant financial writers. Concurrent
+identical requests produce one decision/audit; conflicting requests have one winner.
+Success is sent only after `OwnerWrite` commits. Serialization/deadlock aborts return
+409 `transaction_conflict`; uniqueness conflicts return 409 `decision_conflict`;
+insert/commit-time eligibility failures return 409 `approval_ineligible`. Reload
+details and repeat the same explicit decision only when appropriate. No automatic
+decision retry occurs. Invalid sessions return 401; origin/CSRF failures 403;
+invalid payloads 422; stale snapshots 409 `snapshot_conflict`; generic storage failures
+503 without SQL or secret details. Offset pagination can shift as the queue changes;
+refresh the first page after a decision.
+
+Migration `0003_approval_commit_guard.py` adds a deferred constraint trigger that
+reuses `validate_approval()` at commit, alongside the existing insert-time check.
+A regression test reproduced that revision `0002` could insert while valid, wait
+past expiry and still commit. The additive guard rejects proposal/session expiry
+and invalid snapshot/policy/dispatch bindings during that transaction. It modifies
+no historical rows; revisions `0001` and `0002` are unchanged. Run an explicit
+`alembic upgrade head` only against an authorized database before using this workflow.
+No persistent database was migrated during implementation. Downgrading to `0002`
+preserves history but removes the extra commit-time protection.
+
+Safe usage after the interactive login example below, before logout:
+
+```python
+queue = client.get('/purchases/approval-queue', params={'limit': 20})
+queue.raise_for_status()
+purchase_id = input('Proposal UUID to inspect: ')
+inspected = client.get(f'/purchases/{purchase_id}')
+inspected.raise_for_status()
+proposal = inspected.json()  # Safe details; inspect/render untrusted text as text.
+decision = input('Explicit decision, APPROVE or DENY: ')
+request_body = {
+    'decision': decision,
+    'snapshot_hash': proposal['snapshot_hash'],
+    'snapshot_hash_version': proposal['snapshot_hash_version'],
+}
+csrf_name = '__Host-agentpal_csrf'  # agentpal_csrf_dev for explicit HTTP loopback mode.
+result = client.put(f'/purchases/{purchase_id}/approval', json=request_body,
+                    headers={'X-CSRF-Token': client.cookies[csrf_name]})
+result.raise_for_status()
+result.json()  # Consent and payment state are separate.
+```
+
+PayPal Vault onboarding, dispatch/recovery and reconciliation services remain pending.
+Every eventual Sandbox payment still goes to AgentPal's single Business account,
+not the catalog retailer. Approval places no real retailer order and guarantees no
+physical stock or fulfillment. No live Channel3 or PayPal API is called by these routes.
 
 ## Single-owner authentication
 
@@ -340,7 +461,7 @@ The equivalent module entry point is `rtk proxy uv run python -m agentpal.auth.b
 Only the requested owner and a safe audit event are inserted; there are no seeded
 policies, limits, PayPal references or default credentials. Bootstrap needs the
 database URL but does not need browser-origin settings. Authentication reuses the
-existing schema at revision `0002`; this task adds no migration.
+existing schema; apply the current migration head (`0003`) for approval commit checks.
 
 All configuration is read from exported environment variables, never automatically
 from `.env` or `.env.local`:
@@ -565,7 +686,7 @@ hides such overspending to make the budget appear within its cap.
 
 Alembic is the migration coordinator. `migrations/versions/0001_persistence.sql`
 defines the initial PostgreSQL schema; additive revision `0002` hardens lifecycle,
-capture accounting and limit updates. SQLAlchemy Core
+capture accounting and limit updates, and `0003` adds approval commit checks. SQLAlchemy Core
 and psycopg provide connections; there is no duplicate, incomplete ORM schema
 or autogeneration workflow. Create subsequent reviewed Alembic revisions for
 schema changes. Application connections use READ COMMITTED isolation and hide
@@ -635,7 +756,7 @@ rejects changed quantity. A new selection never proves safe recovery of an uncer
   merchants, hard-limit violations, rejected proposals, missing human approval,
   expired proposals and stale policy versions. This is a final integrity guard;
   the initial deterministic service is implemented in `agentpal.proposals`;
-  final dispatch and human approval services remain pending.
+  human approval is implemented in `agentpal.approvals`; final dispatch remains pending.
 - A passed source check must match product, domain, URL fingerprint, condition,
   unique-offer count, original price, USD and exactly `InStock`. Definitive
   identity/price/availability failures invalidate execution; a later passing
