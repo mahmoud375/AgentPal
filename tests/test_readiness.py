@@ -374,7 +374,7 @@ def test_forward_upgrade_preserves_and_downgrade_refuses_to_erase_preparation(se
         command.downgrade(cfg, "0004")
     with db.connect() as c:
         assert c.scalar(text("SELECT id FROM agentpal.payments")) == prepared.payment_id
-        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
+        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0006"
 
 
 def wait_for_lock(db, pid):

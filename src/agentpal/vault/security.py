@@ -16,15 +16,23 @@ class VaultUnavailable(Exception):
     """Deliberately contains no underlying credential, ciphertext or provider data."""
 
 
-class VaultSettings(BaseSettings):
+class VaultKeySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, extra="ignore", hide_input_in_errors=True)
 
+    active_key_id: str = Field(validation_alias="VAULT_ACTIVE_KEY_ID")
+    keys_json: SecretStr = Field(validation_alias="VAULT_KEYS_JSON", repr=False)
+
+    @model_validator(mode="after")
+    def validate_keys(self):
+        Keyring(self)
+        return self
+
+
+class VaultSettings(VaultKeySettings):
     environment: str = Field(validation_alias="PAYPAL_ENVIRONMENT")
     base_url: str = Field(validation_alias="PAYPAL_BASE_URL")
     client_id: SecretStr = Field(validation_alias="PAYPAL_CLIENT_ID", repr=False)
     client_secret: SecretStr = Field(validation_alias="PAYPAL_CLIENT_SECRET", repr=False)
-    active_key_id: str = Field(validation_alias="VAULT_ACTIVE_KEY_ID")
-    keys_json: SecretStr = Field(validation_alias="VAULT_KEYS_JSON", repr=False)
     ttl_seconds: int = Field(default=1200, ge=120, le=3600, validation_alias="VAULT_TTL_SECONDS")
 
     @model_validator(mode="after")
@@ -33,12 +41,11 @@ class VaultSettings(BaseSettings):
             raise ValueError("Explicit PayPal Sandbox configuration required")
         if not self.client_id.get_secret_value() or not self.client_secret.get_secret_value():
             raise ValueError("PayPal Sandbox credentials required")
-        Keyring(self)
         return self
 
 
 class Keyring:
-    def __init__(self, settings: VaultSettings):
+    def __init__(self, settings: VaultKeySettings):
         self.active = settings.active_key_id
         try:
             raw = json.loads(settings.keys_json.get_secret_value())
@@ -62,15 +69,29 @@ class Keyring:
         return f"agentpal:vault:v1:{identifier}:{purpose}:{key_id}".encode("ascii")
 
     def seal(self, identifier: UUID, purpose: str, value: dict) -> tuple[bytes, str]:
-        nonce = secrets.token_bytes(12)
-        body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-        return nonce + AESGCM(self._keys[self.active]).encrypt(
-            nonce, body, self.aad(identifier, purpose, self.active)), self.active
+        return self.seal_bytes(identifier, purpose, json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+
+    def seal_bytes(self, identifier: UUID, purpose: str, body: bytes) -> tuple[bytes, str]:
+        """Encrypt exact bytes without reserializing financial request evidence."""
+        try:
+            if not isinstance(body, bytes):
+                raise TypeError
+            nonce = secrets.token_bytes(12)
+            return nonce + AESGCM(self._keys[self.active]).encrypt(
+                nonce, body, self.aad(identifier, purpose, self.active)), self.active
+        except (KeyError, ValueError, TypeError, OverflowError):
+            raise VaultUnavailable() from None
+
+    def open_bytes(self, identifier: UUID, purpose: str, ciphertext: bytes, key_id: str) -> bytes:
+        try:
+            return AESGCM(self._keys[key_id]).decrypt(
+                ciphertext[:12], ciphertext[12:], self.aad(identifier, purpose, key_id))
+        except (KeyError, InvalidTag, ValueError, TypeError, UnicodeError):
+            raise VaultUnavailable() from None
 
     def open(self, identifier: UUID, purpose: str, ciphertext: bytes, key_id: str) -> dict:
         try:
-            value = json.loads(AESGCM(self._keys[key_id]).decrypt(
-                ciphertext[:12], ciphertext[12:], self.aad(identifier, purpose, key_id)))
+            value = json.loads(self.open_bytes(identifier, purpose, ciphertext, key_id))
             if not isinstance(value, dict):
                 raise ValueError
             return value

@@ -8,7 +8,10 @@ single-owner authentication, owner policy/budget APIs and a reusable Channel3
 discovery/transient-selection foundation and durable initial purchase proposals
 and secure owner purchase approval and PayPal Sandbox Vault onboarding are
 implemented. Trusted pre-dispatch readiness now reserves shared budget and
-prepares an unsent payment; payment execution and reconciliation remain pending.
+prepares an unsent payment. Encrypted Orders request materialization is implemented
+with an explicit agreement gate. New owner onboarding requests and verifies the
+supported agreement; legacy or insufficient provider evidence remains blocked.
+Payment execution and reconciliation remain pending.
 
 The [authoritative context](docs/AgentPal_Full_Context_Handoff.md) records approved
 decisions, completed experiments and remaining integration work.
@@ -525,8 +528,8 @@ source-check ID, authorization kind and exact money, without provider secrets.
 
 A preparation has **no payment operation**: no fake HTTP payload, encryption
 metadata, request ID, retry window, transmission marker, provider order, capture
-or result is inserted. The final executor must construct actual encrypted request
-bytes and documented endpoint-specific replay policy later. Preparation does not
+or result is inserted. The separate materializer below constructs encrypted request
+bytes and records endpoint-specific replay evidence. Preparation does not
 decrypt Vault references; the executor must validate/decrypt the selected method
 using its retained external keys before claiming dispatch.
 
@@ -581,14 +584,14 @@ would otherwise undercut reserved protection.
 
 Immediately before actual execution, the future executor must freshly retrieve
 and compare the source, repeat policy/TTL/consent/method/payee/financial checks,
-construct and encrypt the real request, verify endpoint replay rules and atomically
+load and verify the committed request bytes, verify endpoint replay rules and atomically
 claim the existing operation/reservation. Commit the claim before HTTP and record
 only actual provider outcomes afterward. Once a claim may have been transmitted,
 retain protection until verified reconciliation. Source observations cannot lock
 retailer data or prove live checkout price, physical stock or fulfillment. The
 30-second preparation bound is not a retailer freshness guarantee or permission
 to reuse that evidence for later dispatch. Zero-value preparation is representable;
-actual provider handling remains a separate execution decision.
+Orders materialization rejects zero rather than fabricating a charge.
 
 Tests use mocked Channel3 and disposable PostgreSQL, including competing agents,
 same-purchase preparation, policy/budget/Vault races, commit expiry/source age,
@@ -604,6 +607,147 @@ Readiness verification: `rtk proxy .venv/bin/pytest -q --tb=line` reported
 source builds, lockfile, compilation and whitespace checks passed. All providers
 were mocked and no persistent database was migrated.
 
+## Offline PayPal Orders request materialization
+
+`agentpal.orders.OrderMaterializationService(readiness, keys)` composes the
+existing `ReadinessService` financial/provenance gates and `Keyring`. Synchronous
+`materialize(context: RunContext, purchase_id: UUID)` accepts only trusted run
+context and a purchase UUID. Async callers should offload it with
+`asyncio.to_thread`. It invokes no readiness refresh, Channel3 adapter or PayPal
+client. There is no HTTP endpoint, browser-session argument, agent tool, dispatch
+claim or network transport. Settings and run identity belong to the backend.
+
+**Agreement gate:** older Vault onboarding omitted `usage_pattern` and all
+agreement-response evidence. Those methods still return `BLOCKED` with
+`PAYMENT_CONTRACT_UNVERIFIED`, with no new payment operation created. New onboarding
+below explicitly requests and verifies the supported agreement. The historical
+spike used `UNSCHEDULED_POSTPAID`; success does not prove that classification or
+its payer agreement matches AgentPal's on-demand simulation. No existing consent
+is rewritten or inferred, and there is no caller/configuration override.
+
+The supported subset requires an encrypted original setup request explicitly
+specifying `usage_type=MERCHANT`, `customer_type=CONSUMER` and
+`usage_pattern=IMMEDIATE`, a completed independently verified setup/method, and
+matching decrypted setup/method customer bindings, plus affirmative agreement
+metadata from the approved setup GET and final payment-token GET. PayPal defines `IMMEDIATE`
+as on-demand, non-recurring, prepaid payments with variable amounts/frequency in
+the [Payment Method Tokens setup contract](https://developer.paypal.com/api/payment-tokens/v3/setup-tokens-create/).
+That description is the engineering basis for the supported subset, not evidence
+that historical methods or this Sandbox account support it. Recurring, deferred,
+missing and postpaid models are blocked. Successful tests use mocked provider
+responses through the real onboarding service; a separately authorized live
+verification must establish actual account/provider behavior. Do not insert synthetic agreements
+or edit immutable historical setups to enable a deployed payment.
+
+The [recurring-payments guide](https://developer.paypal.com/platforms/checkout/standard/customize/save-payment-methods-for-recurring-payments/)
+and [current recurring module](https://developer.paypal.com/v5/checkout/recurring-payments)
+tie usage patterns to payer agreements. They do not establish a default for our
+old patternless setup or justify copying its spike's postpaid label. Account/app
+eligibility, buyer agreement and actual provider behavior still need separate
+authorized verification. No new PayPal capability is claimed by this implementation.
+
+For an explicitly established supported agreement, the
+[Orders Create contract](https://developer.paypal.com/sdk/orders/v2/orders-create/)
+is a **single-step** `POST /v2/checkout/orders` on the fixed Sandbox origin, with
+`intent=CAPTURE` and `payment_source.paypal.vault_id`. This preserves the spike's
+compatible single-step behavior. The exact constrained body contains:
+
+```json
+{
+  "intent": "CAPTURE",
+  "purchase_units": [{
+    "reference_id": "<internal purchase UUID>",
+    "custom_id": "<internal payment UUID>",
+    "amount": {"currency_code": "USD", "value": "<exact positive USD total>"},
+    "payee": {"merchant_id": "<configured Sandbox Business merchant ID>"}
+  }],
+  "payment_source": {"paypal": {
+    "vault_id": "<server-only encrypted method reference>",
+    "stored_credential": {
+      "payment_initiator": "MERCHANT",
+      "usage": "SUBSEQUENT",
+      "usage_pattern": "IMMEDIATE"
+    }
+  }}
+}
+```
+
+This documents the conditional contract, not proof of live execution eligibility.
+The amount comes from the immutable DB purchase and must equal the
+held reservation. `Decimal` renders exactly two fractional digits without rounding;
+zero, negative, nonfinite, malformed, fractional-cent and amounts exceeding the
+documented 32-character money representation are rejected. There is one total,
+one unit and one configured payee; no items, external descriptions, shipping, tax,
+retailer recipient, OAuth header or invented financial charge enters the body.
+No separate Capture operation is materialized. A future executor must inspect
+actual captures before deciding whether any further provider action is justified.
+
+| Durable state | Meaning |
+|---|---|
+| Prepared payment + held reservation, no operation | `PREPARED_UNSENT` readiness history |
+| Same payment + one `create_order` operation, status `prepared`, count 0, dispatch times null | `MATERIALIZED_UNSENT`; exact financial bytes exist, never permission to transmit |
+| Existing dispatch/provider activity | `EXISTING_PAYMENT`; preserve identity and protection for future reconciliation |
+| Definitely-unsent released reservation | `RELEASED_UNSENT`; preserve operation/history, block subsequent claims and replacement |
+
+The transaction reuses owner revision/provenance/agent, current-policy, TTL,
+consent, method uniqueness/revocation and known listing-invalidation checks;
+locks payment/operation and the original budget-period row; checks held capacity
+and the latest recorded listing result. It does not reinterpret preparation's
+commit-only source deadline as fresh dispatch evidence or retrieve another listing.
+Missing/latest failed refresh evidence blocks construction. Existing eligibility
+failures use readiness's proven-unsent release; contract/crypto failures preserve
+the hold for explicit trusted `release_unsent` or investigation. Legacy operations
+lacking materialization provenance cannot be replaced/adopted automatically.
+
+One random UUID identifies the operation and another is its `PayPal-Request-Id`.
+Existing unique `(payment_id, kind)` and `(endpoint, request_id)` constraints plus
+the owner lock prevent competing creations. JSON is serialized once as sorted,
+compact UTF-8 bytes. SHA-256 covers those exact bytes; AES-256-GCM authenticates
+operation, payment, purchase, request ID, purpose/version and key ID. The operation
+and one sanitized `order_materialized` audit commit together. Materialization adds
+no table, financial default or dependency. Agreement/replacement evidence adds
+forward revision `0006`, described below; operation identity remains immutable.
+
+`VaultKeySettings` loads only exported `VAULT_ACTIVE_KEY_ID`/`VAULT_KEYS_JSON`,
+without requiring OAuth credentials or reading dotenv files. `VaultSettings`
+inherits those fields, preserving existing Vault configuration/envelope formats.
+`Keyring.seal_bytes/open_bytes` preserve exact bytes. Retain old keys when rotating
+the active key: replay decrypts the committed envelope, verifies its hash and
+financial shape/bindings and returns the same operation UUID without rebuilding,
+re-encrypting or updating its identity. Missing keys, altered AEAD bindings,
+ciphertext/hash damage or inconsistent references fail closed with fixed error
+codes. `.public()` exposes only internal UUIDs, state/reasons and replay flag;
+`execution_ready` is always false. No plaintext-returning API or debug dump exists.
+
+The endpoint-specific Orders Create documentation, reviewed **2026-10-22**, states
+six-hour request-key retention and explicitly includes single-step PayPal Vault
+requests. Operations retain **21,600 seconds** and that source/check date; no
+negotiated 72-hour extension or Vault's three-hour window is assumed. First-dispatch
+and idempotency-expiry timestamps remain null until the future SQL claim sets
+them. Materialization/restart never starts or extends that window. OAuth Bearer
+authorization is transient future transport data, separate from durable body and
+request identity; see [PayPal API requests](https://developer.paypal.com/api/rest/requests/).
+
+Before commit, failures roll back the new operation/audit without replacing the
+existing hold. After commit, restart/lost-response recovery resolves the same
+purchase and exact operation. Concurrent policy/revocation writers serialize on
+the existing financial lock. Expiry during construction is checked again before
+commit; time may advance afterward. Materialization creates history, so this is
+not permanent authorization or a new dispatch boundary. The future executor must
+freshly revalidate Channel3 after operation creation, repeat all financial and
+agreement/key checks, durably claim and commit before HTTP, then record verified
+provider facts. Unknown/expired replay windows, uncertain outcomes and
+`PAYER_ACTION_REQUIRED` require the approved reconciliation/manual-review behavior.
+
+Verification results are recorded in the authoritative context. Tests exercise
+real disposable PostgreSQL operations and synthetic provider responses, including
+the actual current Vault service's contract rejection. No live provider request,
+payment, persistent database migration, commit or push is part of this task.
+
+Final verification: **644 passed, 1 existing warning in 141.78s**, preserving all
+577 previous cases and adding 67 materialization cases. Offline wheel/source
+builds, lockfile validation, compilation, archive and whitespace checks passed.
+
 ## PayPal Sandbox Vault onboarding
 
 This owner-only backend connects one Sandbox payer payment source. It does not
@@ -615,7 +759,7 @@ There are no AI authorization tools or frontend pages in this slice.
 
 ### Configuration and encrypted storage
 
-Apply the reviewed migration head (`0005`, including Vault revision `0004`) only
+Apply the reviewed migration head (`0006`, including Vault revisions `0004`/`0006`) only
 to a database you are authorized to migrate. The implementation tests use disposable databases; no persistent database
 has been migrated by this work. Existing runtime table grants already cover the
 extended `vault_setups` columns and `payment_methods`; no new table grants are needed.
@@ -649,6 +793,12 @@ this task does not re-encrypt history or remove old keys. Removing a key makes i
 references unreadable and fails closed. Losing the keys loses recovery capability.
 
 ### Endpoint contracts and browser return
+
+`POST /paypal/vault/replace` is an additional owner/CSRF/origin-protected, empty-body
+action for the single active **unverified** method. It starts fresh hosted consent;
+the current method stays active until replacement verifies and commits. There is
+no caller-selected method, agreement, financial field or trust override. A verified
+active agreement is not replaced by this limited legacy-repair action.
 
 | Endpoint | Contract |
 |---|---|
@@ -697,12 +847,14 @@ The fixed-origin, no-redirect HTTP adapter performs only:
 
 1. OAuth `POST /v1/oauth2/token` with client credentials, kept server-side.
 2. `POST /v3/vault/setup-tokens` with a PayPal wallet, `usage_type=MERCHANT`,
-   `customer_type=CONSUMER`, and return/cancel URLs derived from `AUTH_ORIGIN`.
+   `customer_type=CONSUMER`, `usage_pattern=IMMEDIATE`, the fixed disclosure below,
+   `permit_multiple_payment_tokens=true`, and return/cancel URLs from `AUTH_ORIGIN`.
 3. Browser navigation to the single validated Sandbox `approve` link. The
    allowlist is HTTPS `sandbox.paypal.com` or `www.sandbox.paypal.com`, path
    `/agreements/approve`, with exactly the matching `approval_session_id` query.
 4. On authenticated completion, `GET /v3/vault/setup-tokens/{stored_id}` must
-   return the matching ID/customer, PayPal source and `APPROVED` status.
+   return the matching ID/customer, PayPal source and `APPROVED` status. Its
+   normalized agreement observation is encrypted before any token-creation claim.
 5. `POST /v3/vault/payment-tokens` with
    `payment_source.token={id: stored_setup_id, type: SETUP_TOKEN}`.
 6. Persist encrypted returned ID/customer before
@@ -735,7 +887,8 @@ and [payment-token creation](https://developer.paypal.com/api/payment-tokens/v3/
 document three-hour request-key storage. **This implementation never retries either
 creation POST**, even within that window. An uncertain response or crash without
 a durably stored provider ID blocks fresh onboarding and requires operator review;
-there is no reset/replacement/review-resolution API in this slice. Do not delete
+there is no reset/review-resolution API. The explicit legacy-method replacement
+endpoint cannot bypass an uncertain open creation flow. Do not delete
 rows or change request IDs to bypass it. Durable known payment-token IDs support
 repeated authenticated GET verification after restart without another POST.
 Provider failures before token creation can be retried through safe setup GETs;
@@ -745,6 +898,81 @@ cannot complete; retained encrypted observations remain available for later revi
 The [official no-purchase guide](https://developer.paypal.com/api/payment-tokens/save-without-purchase/paypal)
 and [v3 specification](https://developer.paypal.com/api/payment-tokens/v3/schema.json)
 are the contract references; mocked fixtures are not live compatibility evidence.
+
+### Explicit usage agreement and safe replacement
+
+The [setup-token request](https://developer.paypal.com/api/payment-tokens/v3/setup-tokens-create/)
+defines `IMMEDIATE` as non-recurring, prepaid, on-demand payments with variable
+amount/frequency. `MERCHANT` is for direct future transactions with one merchant;
+`PLATFORM` is inappropriate for this single-recipient simulation. No subscription
+schedule or billing plan is introduced. The fixed payer-facing `description` is:
+
+> AgentPal Sandbox: future variable on-demand charges to AgentPal Sandbox Business; no retailer payment or fulfillment.
+
+It fits PayPal's 128-character limit and comes only from trusted backend code.
+The start response exposes `requested_agreement`; the PayPal-hosted review uses
+the requested description. Actual display still requires the browser smoke test.
+Setup agreement fields are distinct from Orders' `payment_initiator=MERCHANT` and
+`usage=SUBSEQUENT`; those Orders fields do not belong in the setup request.
+
+The [wallet response definition](https://developer.paypal.com/api/payment-tokens/v3/definitions/paypal_wallet_response/)
+and [current v3 schema](https://developer.paypal.com/api/payment-tokens/v3/schema.json)
+expose agreement metadata on setup/payment responses, but the fields are optional.
+The adapter preserves only bounded pattern, usage type, customer type and description,
+plus necessary IDs/customer/status. It stores no raw provider JSON, payer PII or
+OAuth token. Duplicate JSON keys and explicitly wrong payment sources fail closed.
+
+| Evidence | What it establishes |
+|---|---|
+| Original encrypted request | The terms AgentPal intentionally requested; not provider acceptance |
+| Setup POST response | Setup/customer identity and approval navigation; optional metadata can expose conflicts |
+| Approved setup GET | Matching setup/customer, PayPal wallet and `APPROVED`; all four agreement fields must explicitly match for agreement eligibility |
+| Payment-token POST | Final token/customer identity retained before further I/O; any returned conflicting metadata blocks activation |
+| Payment-token GET | Independent matching final token/customer/PayPal source; all four agreement fields must explicitly match |
+| Merchant eligibility | Separate app/account capability checks; no local verification flag proves them |
+| Orders success | Actual order/full capture evidence, still unimplemented and never inferred from onboarding |
+
+Absent POST metadata remains recorded as absent. Affirmative independent GETs can
+establish the agreement without claiming the POST echoed it. A missing GET field
+never defaults to the requested value. Any returned agreement-metadata conflict is retained and the
+flow goes to `review_required`. A first connection with basic identity verification
+but insufficient agreement metadata may report `complete`/`connected=true` with
+`agreement_state=unverified`; it **cannot materialize Orders**. Replaying completion
+does not rewrite that evidence or upgrade its trust. Fresh owner consent is required.
+`agreement_state=verified` is derived from the encrypted observations and original
+request each time, not from a writable flag or audit assertion.
+
+Revision `0006_vault_agreement.py` adds immutable encrypted approved-setup and
+final-token agreement observations, each with a retained key ID, and an immutable
+replacement-target FK on `vault_setups`. Legacy rows get null evidence and remain
+unverified. New statement-level locking preserves owner-before-row lock order;
+deferred replacement checks require atomic old-method revocation/new-method
+installation. Reapply the existing runtime EXECUTE grants after an authorized
+upgrade. Downgrade refuses to discard any new agreement or replacement evidence;
+legacy-only disposable schema round trips remain supported. No persistent user
+database was migrated here, and revisions `0001`–`0005` are unchanged.
+
+Replacement requests a distinct setup/token and rejects any known historical
+reference reuse; unreadable historical keys cannot establish freshness. Only a
+new fully verified agreement can replace the original active unverified method.
+Cancellation, expiry, session loss, metadata failure, uncertain POST or transaction
+failure preserve the old method. Unknown/created token obligations remain under
+review; no creation POST is automatically retried. Old methods, provider references,
+audits and financial history are retained. Existing payments never switch method:
+definitely-unsent invalid preparations use readiness cleanup, while potentially
+dispatched work retains its original identity/hold for future recovery.
+
+Encryption authenticates record/purpose/key bindings and protects stored evidence
+against a database-only edit; it is not a PayPal response signature. The trusted
+adapter and server key custody remain security boundaries. Keys and earlier
+envelopes must remain readable during rotation. Offline fixtures establish local
+contract enforcement, not live eligibility, hosted display, or a successful charge.
+
+Verification: the complete offline suite reported **705 passed, 1 existing warning
+in 181.93s**, preserving all 644 prior cases and adding 61 agreement cases. Offline
+wheel/source builds, lockfile validation, compilation and whitespace checks passed.
+All approved decisions, migrations `0001`–`0005`, dependencies and configuration
+placeholders remain unchanged. No persistent database or live API was accessed.
 
 ### Manual Sandbox smoke test — separate, not yet executed
 
@@ -756,6 +984,17 @@ login. Use a reachable HTTPS `AUTH_ORIGIN` with trusted TLS and redacted upstrea
 logs. Explicit HTTP-loopback development is permitted by authentication settings
 but uses insecure development cookie names; it does not establish hosted PayPal
 redirect acceptance or real-browser Secure/Strict behavior.
+
+Before starting, follow the [official account setup and eligibility guide](https://developer.paypal.com/api/payment-tokens/save-without-purchase/paypal):
+Developer Dashboard → REST API apps → your Sandbox app → Sandbox App Settings →
+App Feature Options → Accept payments → Advanced options → Vault. Separately
+check the Business account's Account Settings → Payment Preferences → Save PayPal
+and Venmo payment methods and its eligibility result. PayPal states that reference
+transactions require an approved/configured billing-agreement account; contact
+PayPal/account support if that capability is unclear. The v3 schema states US
+availability; confirm supported Sandbox merchant/payer profiles. A checked Vault
+box alone does not establish reference-transaction permission. Privately confirm
+the REST app's Business merchant matches the configured recipient.
 
 1. Start one backend worker with access logging disabled. Open its same-origin
    `/docs`, then use `/auth/login` to establish the existing owner session. Never
@@ -772,7 +1011,12 @@ redirect acceptance or real-browser Secure/Strict behavior.
    if (started.state === 'awaiting_payer') location.assign(started.approval_url);
    ```
 
-3. Authenticate as the distinct Sandbox payer and approve saving the method.
+   If an unverified method is already connected, explicitly use `/paypal/vault/replace`
+   instead; ordinary `/start` remains blocked. Verify `requested_agreement` matches
+   the terms above. Do not provide agreement fields in the body.
+3. Authenticate as the distinct Sandbox payer and inspect the disclosed future
+   variable on-demand Sandbox charges before approving the saved method. Confirm
+   that no retailer payment or fulfillment is represented.
    Verify a clean fixed `/paypal/vault/returned` location after the redirect.
    Check Strict-cookie behavior locally without exporting network traces: the
    initial callback must succeed even if the owner cookie is absent. Verify no
@@ -792,8 +1036,12 @@ redirect acceptance or real-browser Secure/Strict behavior.
    // Inspect only completed.state and sanitized /paypal/vault/status.
    ```
 
-5. Require `complete` and `connected=true`. Repeating completion must remain
-   complete; starting again must return 409. Verify only encrypted references and
+5. Require `complete`, `connected=true` **and `agreement_state=verified`** for
+   agreement eligibility. Independently verify affirmative approved-setup/final-token
+   GET metadata through trusted private tooling; never fill absent fields in SQL.
+   Missing metadata keeps the agreement unverified; conflicts/reused references
+   require review. Repeating completion must preserve the same evidence; starting
+   again must return 409. Verify only encrypted references and
    safe audit transitions exist using a trusted local inspection that never prints
    ciphertext/plaintext references or keys. Confirm the receiving Business account
    was not overwritten with payer/customer data. Record only safe outcomes.
@@ -802,7 +1050,9 @@ redirect acceptance or real-browser Secure/Strict behavior.
    `review_required`; investigate privately rather than issuing another creation
    request. Do not deliberately lose live creation responses just to test retries.
 
-This smoke test saves a Sandbox method only. Do not run spike charge commands,
+Request presence, provider acknowledgement, hosted approval, merchant capability
+and successful Orders execution are separate facts. This smoke test verifies only
+the saved-method agreement. Do not run spike charge commands,
 Orders, Capture, dispatch or any payment. Browser behavior, callback aliases,
 returned customer binding, app eligibility and live provider response shapes remain
 unverified until this explicit manual check succeeds.
@@ -824,7 +1074,7 @@ The equivalent module entry point is `rtk proxy uv run python -m agentpal.auth.b
 Only the requested owner and a safe audit event are inserted; there are no seeded
 policies, limits, PayPal references or default credentials. Bootstrap needs the
 database URL but does not need browser-origin settings. Authentication reuses the
-existing schema; apply the current migration head (`0005`) for approval, Vault and financial preparation guards.
+existing schema; apply the current migration head (`0006`) for approval, Vault agreement/replacement and financial preparation guards.
 
 All configuration is read from exported environment variables, never automatically
 from `.env` or `.env.local`:

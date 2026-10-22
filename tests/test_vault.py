@@ -20,6 +20,7 @@ from agentpal.main import create_app
 from agentpal.vault.paypal import PayPal, approval_url
 from agentpal.vault.security import Keyring, VaultSettings, VaultUnavailable
 from agentpal.vault.service import Authority, VaultService
+from agentpal.vault.agreement import DESCRIPTION
 
 
 ORIGIN = "https://agentpal.test"
@@ -49,6 +50,7 @@ class Provider:
         self.entered = Event()
         self.released = Event()
         self.transform = lambda path, value: value
+        self.setup_id, self.token_id = SETUP, TOKEN
 
     def __call__(self, request):
         assert self.engine.pool.checkedout() == 0, "Network must not hold database connections"
@@ -66,19 +68,22 @@ class Provider:
             result = {"access_token": "fictional_oauth_secret", "token_type": "Bearer"}
         elif path == "/v3/vault/setup-tokens":
             assert request.method == "POST" and request.headers["PayPal-Request-Id"]
+            number = self.count(path)
+            self.setup_id = SETUP if number == 1 else f"FICTIONAL_SETUP_{number:02}"
+            self.token_id = TOKEN if number == 1 else f"FICTIONAL_TOKEN_{number:02}"
             self.payload = json.loads(request.content)
-            result = {"id": SETUP, "customer": {"id": CUSTOMER}, "status": "PAYER_ACTION_REQUIRED",
-                      "links": [{"rel": "approve", "method": "GET", "href": f"https://sandbox.paypal.com/agreements/approve?approval_session_id={SETUP}"}]}
-        elif path == f"/v3/vault/setup-tokens/{SETUP}":
+            result = {"id": self.setup_id, "customer": {"id": CUSTOMER}, "status": "PAYER_ACTION_REQUIRED",
+                      "links": [{"rel": "approve", "method": "GET", "href": f"https://sandbox.paypal.com/agreements/approve?approval_session_id={self.setup_id}"}]}
+        elif path == f"/v3/vault/setup-tokens/{self.setup_id}":
             assert request.method == "GET"
-            result = {"id": SETUP, "customer": {"id": CUSTOMER}, "status": "APPROVED", "payment_source": {"paypal": {}}}
+            result = {"id": self.setup_id, "customer": {"id": CUSTOMER}, "status": "APPROVED", "payment_source": {"paypal": {}}}
         elif path == "/v3/vault/payment-tokens":
             assert request.method == "POST" and request.headers["PayPal-Request-Id"]
-            assert json.loads(request.content) == {"payment_source": {"token": {"id": SETUP, "type": "SETUP_TOKEN"}}}
-            result = {"id": TOKEN, "customer": {"id": CUSTOMER}}
-        elif path == f"/v3/vault/payment-tokens/{TOKEN}":
+            assert json.loads(request.content) == {"payment_source": {"token": {"id": self.setup_id, "type": "SETUP_TOKEN"}}}
+            result = {"id": self.token_id, "customer": {"id": CUSTOMER}}
+        elif path == f"/v3/vault/payment-tokens/{self.token_id}":
             assert request.method == "GET"
-            result = {"id": TOKEN, "customer": {"id": CUSTOMER}, "payment_source": {"paypal": {}}}
+            result = {"id": self.token_id, "customer": {"id": CUSTOMER}, "payment_source": {"paypal": {}}}
         else:
             pytest.fail("Unexpected provider operation")
         result = self.transform(path, result)
@@ -145,6 +150,7 @@ def test_success_strict_callback_encryption_and_boundaries(flow, db):
     assert client.get("/paypal/vault/status").json() == {"connected": False, "onboarding": None}
     identifier = start(flow)
     assert provider.payload == {"payment_source": {"paypal": {"usage_type": "MERCHANT", "customer_type": "CONSUMER",
+        "usage_pattern": "IMMEDIATE", "description": DESCRIPTION, "permit_multiple_payment_tokens": True,
         "experience_context": {"return_url": provider.return_url(), "cancel_url": provider.return_url(True)}}}}
     assert client.post("/paypal/vault/start", json={}).json()["onboarding_id"] == identifier
     assert provider.count("/v3/vault/setup-tokens") == 1
@@ -502,7 +508,7 @@ def test_guarded_downgrade_preserves_onboarding_evidence(flow, db):
         command.downgrade(cfg, "0003")
     with db.connect() as c:
         assert c.scalar(text("SELECT id FROM agentpal.vault_setups")) == UUID(identifier)
-        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
+        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0006"
 
 
 @pytest.mark.parametrize("failure", ["bad_link", "bad_id", "malformed_json", "large", "provider_error"])

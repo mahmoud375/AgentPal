@@ -61,6 +61,12 @@ def start(authority: Write, vault: Vault):
     return vault.start(authority)
 
 
+@router.post("/replace")
+def replace(authority: Write, vault: Vault):
+    """Fresh hosted consent for the single active unverified legacy agreement."""
+    return vault.start(authority, replace=True)
+
+
 @router.post("/{onboarding_id}/complete")
 def complete(onboarding_id: str, request: Request, authority: Write, vault: Vault):
     try:

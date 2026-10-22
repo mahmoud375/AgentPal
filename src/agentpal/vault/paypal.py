@@ -10,9 +10,17 @@ from urllib.parse import parse_qsl, urlsplit
 import httpx
 
 from agentpal.vault.security import VaultSettings, VaultUnavailable
+from agentpal.vault.agreement import metadata
 
 
 _PRIVATE_IO = ContextVar("agentpal_private_paypal_io", default=False)
+
+
+def _unique_object(pairs):
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError
+    return value
 
 
 class _PrivateProviderLogs(logging.Filter):
@@ -90,7 +98,7 @@ class PayPal:
                         if monotonic() > deadline or len(body) + len(chunk) > 65536:
                             raise VaultUnavailable()
                         body.extend(chunk)
-                    value = json.loads(body)
+                    value = json.loads(body, object_pairs_hook=_unique_object)
                     if not isinstance(value, dict):
                         raise VaultUnavailable()
                     return value
@@ -118,16 +126,19 @@ class PayPal:
             links = [link for link in result["links"] if link.get("rel") == "approve" and link.get("method") == "GET"]
             if len(links) != 1:
                 raise VaultUnavailable()
-            return {"id": identifier, "customer_id": cid, "approval_url": approval_url(links[0]["href"], identifier)}
+            return {"id": identifier, "customer_id": cid, "status": result["status"], "metadata": metadata(result),
+                    "approval_url": approval_url(links[0]["href"], identifier)}
         except (KeyError, TypeError, AttributeError):
             raise VaultUnavailable() from None
 
-    def approved(self, setup: dict) -> None:
+    def approved(self, setup: dict) -> dict:
         result = self._request("GET", "/v3/vault/setup-tokens/" + reference(setup["id"]), bearer=self.oauth())
         try:
             if (result["id"] != setup["id"] or result["customer"]["id"] != setup["customer_id"]
                     or result["status"] != "APPROVED" or not isinstance(result["payment_source"]["paypal"], dict)):
                 raise VaultUnavailable()
+            return {"id": result["id"], "customer_id": result["customer"]["id"],
+                    "status": result["status"], "metadata": metadata(result)}
         except (KeyError, TypeError):
             raise VaultUnavailable() from None
 
@@ -136,16 +147,18 @@ class PayPal:
         result = self._request("POST", "/v3/vault/payment-tokens", bearer=self.oauth(),
                                payload=payload, request_id=request_id)
         try:
-            return {"id": reference(result["id"]), "customer_id": customer(result["customer"]["id"])}
+            return {"id": reference(result["id"]), "customer_id": customer(result["customer"]["id"]),
+                    "metadata": metadata(result)}
         except (KeyError, TypeError):
             raise VaultUnavailable() from None
 
-    def verify(self, token: dict, setup: dict) -> None:
+    def verify(self, token: dict, setup: dict) -> dict:
         result = self._request("GET", "/v3/vault/payment-tokens/" + reference(token["id"]), bearer=self.oauth())
         try:
             if (result["id"] != token["id"] or result["customer"]["id"] != token["customer_id"]
                     or token["customer_id"] != setup["customer_id"]
                     or not isinstance(result["payment_source"]["paypal"], dict)):
                 raise VaultUnavailable()
+            return {"id": result["id"], "customer_id": result["customer"]["id"], "metadata": metadata(result)}
         except (KeyError, TypeError):
             raise VaultUnavailable() from None

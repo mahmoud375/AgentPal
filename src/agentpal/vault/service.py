@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy import text
 
 from agentpal.auth.service import AuthService, token_hash, valid_token
+from agentpal.vault.agreement import TERMS, conflicts, evaluate, stored_state
 from agentpal.vault.paypal import PayPal, approval_url
 from agentpal.vault.security import Keyring, VaultSettings, VaultUnavailable
 
@@ -57,7 +58,9 @@ class VaultService:
     def decode(self, row, purpose):
         names = {"flow": ("flow_ciphertext", "flow_key_id"),
                  "setup": ("setup_reference_ciphertext", "encryption_key_id"),
-                 "token": ("token_ciphertext", "token_key_id")}
+                 "token": ("token_ciphertext", "token_key_id"),
+                 "approved-setup": ("approved_reference_ciphertext", "approved_key_id"),
+                 "usage-agreement": ("agreement_evidence_ciphertext", "agreement_evidence_key_id")}
         cipher, key = names[purpose]
         return self.keys.open(row["id"], purpose, row[cipher], row[key])
 
@@ -73,24 +76,48 @@ class VaultService:
                 row.get("origin_session_active") is False and phase not in ("complete", "canceled", "expired")):
             state = "review_required"
         result = {"onboarding_id": str(row["id"]), "state": state,
-                  "expires_at": row["expires_at"].isoformat()}
+                  "expires_at": row["expires_at"].isoformat(), "agreement_state": "unverified",
+                  "replacement": row["replaces_payment_method_id"] is not None}
         if url is not None:
             result["approval_url"] = url
         return result
 
+    def completed_view(self, c, row):
+        result = self.view(row)
+        if row["agreement_evidence_ciphertext"] is not None:
+            method = c.execute(text("SELECT reference_ciphertext,encryption_key_id FROM agentpal.payment_methods WHERE vault_setup_id=:id"),
+                {"id": row["id"]}).mappings().one()
+            reference = self.keys.open(row["id"], "payment-method", method["reference_ciphertext"], method["encryption_key_id"])
+            result["agreement_state"] = stored_state(self.keys, row, reference)
+        return result
+
     def status(self):
         with self.auth.engine.connect() as c:
-            connected = c.scalar(text("SELECT EXISTS(SELECT 1 FROM agentpal.payment_methods WHERE revoked_at IS NULL)"))
+            active = c.execute(text("""SELECT s.*,s.expires_at<=clock_timestamp() AS expired FROM agentpal.payment_methods m JOIN agentpal.vault_setups s
+                ON s.id=m.vault_setup_id WHERE m.revoked_at IS NULL""")).mappings().all()
             row = c.execute(text("""SELECT v.*,v.expires_at<=clock_timestamp() AS expired,
                 s.revoked_at IS NULL AND s.expires_at>clock_timestamp() AS origin_session_active
                 FROM agentpal.vault_setups v JOIN agentpal.owner_sessions s ON s.id=v.owner_session_id
                 WHERE v.flow_phase IS NOT NULL ORDER BY v.created_at DESC LIMIT 1""")).mappings().one_or_none()
-            return {"connected": connected, "onboarding": self.view(row) if row else None}
+            result = {"connected": bool(active), "onboarding": (
+                self.completed_view(c, row) if row["flow_phase"] == "complete" else self.view(row)) if row else None}
+            if active:
+                result["agreement_state"] = self.completed_view(c, active[0])["agreement_state"] if len(active) == 1 else "unverified"
+            return result
 
-    def start(self, authority: Authority):
+    def start(self, authority: Authority, *, replace=False):
         with self.owner_transaction(authority) as (c, owner):
-            if c.scalar(text("SELECT EXISTS(SELECT 1 FROM agentpal.payment_methods WHERE revoked_at IS NULL)")):
+            active = c.execute(text("SELECT id FROM agentpal.payment_methods WHERE revoked_at IS NULL FOR SHARE")).scalars().all()
+            if active and not replace:
                 raise conflict("already_connected")
+            if replace and len(active) != 1:
+                raise conflict("replacement_target_required")
+            target = active[0] if replace else None
+            if target is not None:
+                previous = c.execute(text("""SELECT s.*,s.expires_at<=clock_timestamp() AS expired FROM agentpal.vault_setups s JOIN agentpal.payment_methods m
+                    ON m.vault_setup_id=s.id WHERE m.id=:id"""), {"id": target}).mappings().one()
+                if self.completed_view(c, previous)["agreement_state"] == "verified":
+                    raise conflict("agreement_already_verified")
             old = c.execute(text("""SELECT *,expires_at<=clock_timestamp() AS expired FROM agentpal.vault_setups
                 WHERE flow_phase NOT IN ('complete','canceled','expired') FOR UPDATE""")).mappings().one_or_none()
             if old:
@@ -98,6 +125,8 @@ class VaultService:
                     c.execute(text("UPDATE agentpal.vault_setups SET flow_phase='expired',status='failed' WHERE id=:id"), {"id": old["id"]})
                 else:
                     self.same_session(old, owner)
+                    if old["replaces_payment_method_id"] != target:
+                        raise conflict()
                     url = None
                     if old["flow_phase"] == "awaiting_payer":
                         setup = self.decode(old, "setup")
@@ -106,18 +135,18 @@ class VaultService:
             identifier, state = uuid4(), secrets.token_urlsafe(32)
             origin = self.auth.settings.origin
             payload = {"payment_source": {"paypal": {
-                "usage_type": "MERCHANT", "customer_type": "CONSUMER",
+                **TERMS, "permit_multiple_payment_tokens": True,
                 "experience_context": {
                     "return_url": f"{origin}/paypal/vault/return?state={state}",
                     "cancel_url": f"{origin}/paypal/vault/cancel?state={state}"}}}}
             cipher, key = self.keys.seal(identifier, "flow", payload)
             setup_request_id, token_request_id = uuid4(), uuid4()
             c.execute(text("""INSERT INTO agentpal.vault_setups
-                (id,owner_session_id,state_hash,expires_at,flow_phase,flow_ciphertext,flow_key_id,setup_request_id,token_request_id)
-                VALUES (:id,:session,:hash,clock_timestamp()+:ttl*interval '1 second','setup_post',:cipher,:key,:setup_request,:token_request)"""),
+                (id,owner_session_id,state_hash,expires_at,flow_phase,flow_ciphertext,flow_key_id,setup_request_id,token_request_id,replaces_payment_method_id)
+                VALUES (:id,:session,:hash,clock_timestamp()+:ttl*interval '1 second','setup_post',:cipher,:key,:setup_request,:token_request,:target)"""),
                 {"id": identifier, "session": owner.session_id, "hash": token_hash(state, "vault-state"),
                  "ttl": self.settings.ttl_seconds, "cipher": cipher, "key": key,
-                 "setup_request": setup_request_id, "token_request": token_request_id})
+                 "setup_request": setup_request_id, "token_request": token_request_id, "target": target})
             c.execute(text("""INSERT INTO agentpal.audit_events(actor_kind,owner_session_id,kind,details)
                 VALUES ('owner',:session,'vault_started',CAST(:details AS jsonb))"""),
                 {"session": owner.session_id, "details": json.dumps({"onboarding_id": str(identifier)})})
@@ -131,9 +160,11 @@ class VaultService:
             return self.operation(authority, identifier)
         with self.auth.engine.begin() as c:
             c.execute(text("SELECT id FROM agentpal.owners WHERE id=true FOR UPDATE"))
-            c.execute(text("""UPDATE agentpal.vault_setups SET flow_phase='awaiting_payer',status='pending',
+            fresh = self.fresh_setup(c, identifier, setup)
+            c.execute(text("""UPDATE agentpal.vault_setups SET flow_phase=:phase,status='pending',
                 setup_reference_ciphertext=:cipher,encryption_key_id=:key WHERE id=:id AND flow_phase='setup_post'"""),
-                {"cipher": cipher, "key": key, "id": identifier})
+                {"cipher": cipher, "key": key, "id": identifier,
+                 "phase": "review" if conflicts(setup) or not fresh else "awaiting_payer"})
         # Recheck the original session after network I/O; observation durability
         # never depends on a still-live browser, but exposing/activating it does.
         return self.operation(authority, identifier, include_url=True)
@@ -146,7 +177,11 @@ class VaultService:
             if include_url and row["flow_phase"] == "awaiting_payer" and not row["expired"]:
                 setup = self.decode(row, "setup")
                 url = approval_url(setup["approval_url"], setup["id"])
-            return self.view(row, url=url)
+            result = self.completed_view(c, row) if row["flow_phase"] == "complete" else self.view(row, url=url)
+            flow = self.decode(row, "flow")
+            if all(flow.get("payment_source", {}).get("paypal", {}).get(k) == v for k, v in TERMS.items()):
+                result["requested_agreement"] = dict(TERMS)
+            return result
 
     def review(self, identifier, expected):
         with self.auth.engine.begin() as c:
@@ -186,12 +221,39 @@ class VaultService:
                 not hmac.compare_digest(row["receipt_hash"], token_hash(receipt, "vault-receipt"))):
             raise HTTPException(403, "PayPal browser return required")
 
+    @staticmethod
+    def check_target(c, row):
+        active = c.execute(text("SELECT id FROM agentpal.payment_methods WHERE revoked_at IS NULL FOR SHARE")).scalars().all()
+        target = row["replaces_payment_method_id"]
+        if (target is None and active) or (target is not None and active != [target]):
+            raise conflict("replacement_target_changed" if target else "already_connected")
+
+    def fresh_reference(self, c, token):
+        # Even a successful new consent must not silently reuse a historical token.
+        # Keep old keys: unreadable history cannot prove a fresh reference.
+        for old in c.execute(text("SELECT vault_setup_id,reference_ciphertext,encryption_key_id FROM agentpal.payment_methods")).mappings():
+            reference = self.keys.open(old["vault_setup_id"], "payment-method", old["reference_ciphertext"], old["encryption_key_id"])
+            if reference.get("id") == token["id"]:
+                return False
+        return True
+
+    def fresh_setup(self, c, identifier, setup):
+        for old in c.execute(text("""SELECT id,setup_reference_ciphertext,encryption_key_id FROM agentpal.vault_setups
+                WHERE id<>:id AND setup_reference_ciphertext IS NOT NULL"""), {"id": identifier}).mappings():
+            try:
+                previous = self.keys.open(old["id"], "setup", old["setup_reference_ciphertext"], old["encryption_key_id"])
+            except VaultUnavailable:
+                return False
+            if previous.get("id") == setup["id"]:
+                return False
+        return True
+
     def complete(self, authority: Authority, identifier: UUID, receipt: str | None):
         with self.owner_transaction(authority) as (c, owner):
             row = self.row(c, identifier)
             self.same_session(row, owner)
             if row["flow_phase"] == "complete":
-                return self.view(row)
+                return self.completed_view(c, row)
             self.check_receipt(row, receipt)
             phase = row["flow_phase"]
             if phase not in ("returned", "verifying_token"):
@@ -207,7 +269,7 @@ class VaultService:
             token = self.decode(row, "token") if phase == "verifying_token" else None
         if token is None:
             try:
-                self.provider.approved(setup)
+                approved = self.provider.approved(setup)
             except VaultUnavailable:
                 # Safe, read-only GET may be repeated by the authenticated owner.
                 return self.operation(authority, identifier)
@@ -216,9 +278,13 @@ class VaultService:
                 self.same_session(row, owner)
                 if row["flow_phase"] != "returned" or row["expired"]:
                     return self.view(row)
-                if c.scalar(text("SELECT EXISTS(SELECT 1 FROM agentpal.payment_methods WHERE revoked_at IS NULL)")):
-                    raise conflict("already_connected")
-                c.execute(text("UPDATE agentpal.vault_setups SET flow_phase='token_post' WHERE id=:id"), {"id": identifier})
+                self.check_target(c, row)
+                cipher, key = self.keys.seal(identifier, "approved-setup", approved)
+                c.execute(text("""UPDATE agentpal.vault_setups SET flow_phase=:phase,
+                    approved_reference_ciphertext=:cipher,approved_key_id=:key WHERE id=:id"""),
+                    {"id": identifier, "cipher": cipher, "key": key, "phase": "review" if conflicts(approved) else "token_post"})
+                if conflicts(approved):
+                    return self.view(self.row(c, identifier))
                 request_id = row["token_request_id"]
             try:
                 token = self.provider.tokenize(setup, request_id)
@@ -228,26 +294,42 @@ class VaultService:
                 return self.operation(authority, identifier)
             with self.auth.engine.begin() as c:
                 c.execute(text("SELECT id FROM agentpal.owners WHERE id=true FOR UPDATE"))
-                c.execute(text("""UPDATE agentpal.vault_setups SET flow_phase='verifying_token',token_ciphertext=:cipher,
-                    token_key_id=:key WHERE id=:id AND flow_phase='token_post'"""), {"id": identifier, "cipher": cipher, "key": key})
+                c.execute(text("""UPDATE agentpal.vault_setups SET flow_phase=:phase,token_ciphertext=:cipher,
+                    token_key_id=:key WHERE id=:id AND flow_phase='token_post'"""),
+                    {"id": identifier, "cipher": cipher, "key": key, "phase": "review" if conflicts(token) else "verifying_token"})
+            if conflicts(token):
+                return self.operation(authority, identifier)
         try:
-            self.provider.verify(token, setup)
+            retrieved = self.provider.verify(token, setup)
         except VaultUnavailable:
             return self.operation(authority, identifier)
         with self.owner_transaction(authority) as (c, owner):
             row = self.row(c, identifier)
             self.same_session(row, owner)
             if row["flow_phase"] == "complete":
-                return self.view(row)
+                return self.completed_view(c, row)
             if row["flow_phase"] != "verifying_token":
                 raise conflict()
             if row["expired"]:
                 c.execute(text("UPDATE agentpal.vault_setups SET flow_phase='review' WHERE id=:id"), {"id": identifier})
                 return {**self.view(row), "state": "review_required"}
-            if c.scalar(text("SELECT EXISTS(SELECT 1 FROM agentpal.payment_methods WHERE revoked_at IS NULL)")):
-                raise conflict("already_connected")
+            self.check_target(c, row)
+            approved = self.decode(row, "approved-setup") if row["approved_reference_ciphertext"] is not None else {}
+            token = self.decode(row, "token")
+            agreement = evaluate(self.decode(row, "flow"), self.decode(row, "setup"), approved, token, retrieved)
+            if agreement == "verified" and not self.fresh_reference(c, token):
+                agreement = "conflict"
+            cipher, key = self.keys.seal(identifier, "usage-agreement", {"version": 1, "payment_token": retrieved})
+            if agreement == "conflict" or (row["replaces_payment_method_id"] is not None and agreement != "verified"):
+                c.execute(text("""UPDATE agentpal.vault_setups SET flow_phase='review',agreement_evidence_ciphertext=:cipher,
+                    agreement_evidence_key_id=:key WHERE id=:id"""), {"id": identifier, "cipher": cipher, "key": key})
+                return self.view(self.row(c, identifier))
             verified_at = c.scalar(text("""UPDATE agentpal.vault_setups SET flow_phase='complete',status='verified',
-                verified_at=clock_timestamp() WHERE id=:id RETURNING verified_at"""), {"id": identifier})
+                verified_at=clock_timestamp(),agreement_evidence_ciphertext=:cipher,agreement_evidence_key_id=:key
+                WHERE id=:id RETURNING verified_at"""), {"id": identifier, "cipher": cipher, "key": key})
+            if row["replaces_payment_method_id"] is not None:
+                c.execute(text("UPDATE agentpal.payment_methods SET revoked_at=clock_timestamp() WHERE id=:id"),
+                    {"id": row["replaces_payment_method_id"]})
             # Separate AAD purpose prevents a setup/recovery ciphertext from
             # being substituted for a usable payment-method reference.
             cipher, key = self.keys.seal(identifier, "payment-method", token)
@@ -255,5 +337,6 @@ class VaultService:
                 VALUES (:id,:cipher,:key,:verified)"""), {"id": identifier, "cipher": cipher, "key": key, "verified": verified_at})
             c.execute(text("""INSERT INTO agentpal.audit_events(actor_kind,owner_session_id,kind,details)
                 VALUES ('owner',:session,'vault_connected',CAST(:details AS jsonb))"""),
-                {"session": owner.session_id, "details": json.dumps({"onboarding_id": str(identifier)})})
-            return self.view(self.row(c, identifier))
+                {"session": owner.session_id, "details": json.dumps({"onboarding_id": str(identifier),
+                    "agreement_state": agreement, "replacement": row["replaces_payment_method_id"] is not None})})
+            return self.completed_view(c, self.row(c, identifier))
