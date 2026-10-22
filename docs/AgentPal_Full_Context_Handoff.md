@@ -1,7 +1,7 @@
 # AgentPal — Full Project Context & Progress Handoff
 
-**Last updated:** 2026-10-21  
-**Status:** PayPal/Channel3 feasibility and the FastAPI foundation passed. PostgreSQL persistence, owner authentication/policy/budget APIs, Channel3 discovery, idempotent proposals and secure human purchase approval/read APIs are implemented. Provider behavior is tested offline with synthetic fixtures; live adapter compatibility remains unverified. Reservation/payment orchestration, agent runtime and end-to-end execution remain unimplemented.
+**Last updated:** 2026-10-22
+**Status:** PayPal/Channel3 feasibility and the FastAPI foundation passed. PostgreSQL persistence, owner authentication/policy/budget APIs, Channel3 discovery, idempotent proposals, secure human purchase approval/read APIs and secure PayPal Sandbox Vault onboarding are implemented. Provider behavior is tested offline with synthetic fixtures; live adapter compatibility remains unverified. Reservation/payment orchestration, agent runtime and end-to-end execution remain unimplemented.
 
 **Purpose:** The single authoritative project context for the existing AgentPal repository.
 
@@ -196,12 +196,12 @@ Approval must bind to the unchanged purchase snapshot, verified human identity, 
 | Backend | FastAPI in existing `src/agentpal/` package |
 | Bootstrap | `src/agentpal/main.py`: `FastAPI(title="AgentPal API", version="0.1.0")`; `GET /health` returns `{"status":"ok"}` |
 | Packaging | `pyproject.toml`: project version `0.1.0`, Python `>=3.12`, uv build backend; `uv.lock` present |
-| Existing dependencies | FastAPI/HTTPX/Pydantic stack plus SQLAlchemy 2.0, psycopg 3, Alembic and argon2-cffi; pytest is a development dependency, with exact resolution in `uv.lock` |
+| Existing dependencies | FastAPI/HTTPX/Pydantic stack plus SQLAlchemy 2.0, psycopg 3, Alembic, argon2-cffi and cryptography for AES-GCM; pytest is a development dependency, with exact resolution in `uv.lock` |
 | Package entry point | `src/agentpal/__init__.py` still contains the starter CLI greeting; it is not completed application orchestration |
 | Agent | PydanticAI planned; no live integration implemented |
 | Product discovery | `channel3.py` fixed-origin search/detail adapter and `discovery.py` bounded transient references/independent comparison implemented offline; no HTTP routes or agent runtime |
-| Payments | `scripts/spike_paypal.py` Vault/Orders spike passed; not integrated into FastAPI |
-| Database | PostgreSQL-native SQL schema, Alembic revisions `0001`–`0003`, SQLAlchemy Core/psycopg connections and database guards implemented; no duplicate ORM schema |
+| Payments | Historical Vault/Orders spike passed; Sandbox Vault onboarding now integrated into FastAPI with mocked verification; Orders/Capture services remain unimplemented |
+| Database | PostgreSQL-native SQL schema, Alembic revisions `0001`–`0004`, SQLAlchemy Core/psycopg connections and database guards implemented; no duplicate ORM schema |
 | Local database setup | Tests start isolated local PostgreSQL clusters; PostgreSQL 18.6 is available and was used. No persistent database or Compose service was provisioned |
 | Owner access | Interactive owner bootstrap and `/auth/login`, `/auth/me`, `/auth/logout` implemented; no public registration |
 | Policy / budget services | Owner-only configuration/history/current budget and human approval/read APIs plus reusable proposal evaluation implemented; no reservation/payment-dispatch service |
@@ -261,11 +261,11 @@ The following sequence is an implementation brief under Section 3, **not an appr
 
 Monthly renewal is on demand and uses UTC calendar boundaries. Unused funds do not roll over; previous-period obligations remain in their original period even if resolved later. The exact period-binding rule for an unexecuted proposal crossing a month boundary remains OPEN; a new month must not silently erase or move existing reservations.
 
-Vault onboarding is a separate owner-initiated flow (Decision 14). Its PayPal-hosted authorization does not authorize an interactive purchase fallback. Final states, allowed transitions, recovery behavior, and race protection need explicit design review before implementation.
+Vault onboarding is a separate owner-initiated flow (Decision 14). Its PayPal-hosted authorization does not authorize an interactive purchase fallback. The implemented onboarding flow below has durable creation claims, callback/session binding, read-only recovery and conservative review outcomes; payment dispatch remains separate.
 
 ## 7. Implemented PostgreSQL persistence
 
-The initial schema is `migrations/versions/0001_persistence.sql`; additive revision `0002` hardens lifecycle/accounting/budget guards, and `0003` rechecks new human decisions at commit. Neither rewrites prior migration history or historical rows. Connection configuration lives in `src/agentpal/db/`; no credential files are loaded automatically and importing the application does not migrate/connect. See [README](../README.md#persistence-architecture) for entities, migration commands, transaction rules, access grants and limitations, and [the targeted review](Persistence_Hardening_Review.md) for findings and upgrade compatibility.
+The initial schema is `migrations/versions/0001_persistence.sql`; additive revision `0002` hardens lifecycle/accounting/budget guards, `0003` rechecks new human decisions at commit, and `0004` adds durable Vault onboarding claims, encrypted recovery material and commit-time completion guards. These revisions do not rewrite prior migration history or historical rows. Connection configuration lives in `src/agentpal/db/`; no credential files are loaded automatically and importing the application does not migrate/connect. See [README](../README.md#persistence-architecture) for entities, migration commands, transaction rules, access grants and limitations, and [the targeted review](Persistence_Hardening_Review.md) for findings and upgrade compatibility.
 
 Implemented responsibilities: one owner and hashed session/CSRF persistence; agents; immutable policy versions; UTC monthly periods; immutable purchases and human approvals; offer revalidation evidence; Vault onboarding/encrypted method-reference storage; reservations; payments and separate immutable POST operations; provider observations/confirmed captures; append-only audit. There are no permanent discovery/product/merchant catalog, organization or webhook tables.
 
@@ -575,6 +575,102 @@ old migrations remain unchanged; the sole prior test edit updates the expected
 head revision from `0002` to `0003`. No real credential files, live APIs or persistent
 databases were accessed; no commit or push occurred.
 
+### Implemented secure PayPal Sandbox Vault onboarding (2026-10-22)
+
+`src/agentpal/vault/` implements owner-only setup/completion/status APIs and the
+Sandbox Payment Method Tokens v3 adapter. Forward revision
+`0004_vault_onboarding.py` extends existing `vault_setups` with phase, immutable
+per-endpoint request UUIDs, encrypted setup request and token-recovery evidence,
+and hashed browser receipt/return time. It adds a unique open-flow index, guarded
+transitions and a deferred completion eligibility/evidence check. Existing
+`payment_methods` and append-only owner/system audit tables are reused. Legacy
+rows remain unchanged. Downgrade refuses to discard managed flow evidence; a
+legacy-only disposable database can still downgrade/upgrade compatibly.
+
+Routes:
+
+- `POST /paypal/vault/start`: existing owner cookie, exact trusted origin and CSRF;
+  empty body or `{}`. Returns internal onboarding UUID, safe state/deadline and
+  validated approval navigation URL only when the original session may use it.
+- `GET /paypal/vault/status`: authenticated owner; connected boolean and safe
+  latest onboarding UUID/state/deadline, without provider IDs or URLs.
+- `GET /paypal/vault/return` and `/cancel`: unauthenticated browser entry checks
+  cryptographic state, expiry, original active session record, expected pending
+  phase and matching optional provider IDs; consumes state once, sets a separate
+  Strict/HttpOnly receipt and 303 redirects to fixed query-free
+  `GET /paypal/vault/returned` JSON. No owner session is created.
+- `POST /paypal/vault/{onboarding_id}/complete`: original active session, trusted
+  origin, CSRF and return receipt; independent provider verification precedes
+  atomic verified-method installation. Duplicate completion is safe.
+
+The initial cross-site browser return does not require the SameSite=Strict owner
+cookie. The owner must make a fresh same-origin visit/action to complete; existing
+owner cookies remain Strict, Secure and host-only. Callback and purchase approval
+are unrelated capabilities. There are no frontend pages, AI authorization tools,
+Orders, Capture, payments, reservations, dispatch or Channel3 calls in this slice.
+
+Exact provider flow: OAuth client credentials; setup-token POST with PayPal
+`usage_type=MERCHANT`, `customer_type=CONSUMER`, server-derived return/cancel URLs;
+validated Sandbox `/agreements/approve?approval_session_id=...` browser navigation;
+setup-token GET requiring matching ID/customer, PayPal source and `APPROVED`;
+payment-token POST using `payment_source.token` with `type=SETUP_TOKEN`; durable
+encrypted token response; payment-token GET requiring matching ID/customer and
+PayPal source; verified setup/method and owner audit committed together. The
+payment-token GET has no invented status requirement. Payer/customer identity
+never replaces AgentPal's single receiving Sandbox Business account.
+
+The adapter hardcodes the permitted Sandbox API origin through exact validated
+configuration, constructs paths from validated stored IDs, never follows provider
+links/redirects server-side, disables environment proxy configuration, bounds
+JSON bodies and HTTP timeouts, and sanitizes exceptions/provider logs. Callback
+query data is removed from Uvicorn's response-time access-log scope; responses
+have no-store/no-referrer/CSP protections. Upstream proxies/tracers must suppress
+query strings, bodies, cookies and provider URLs separately. The necessary
+approval-navigation URL is sensitive and is the only public setup-reference
+exception; sanitized status never includes it.
+
+`cryptography` provides AES-256-GCM with fresh 12-byte nonces and record/purpose/
+key-ID associated data. Encrypted envelopes contain only necessary request and
+setup/customer/token/approval references; no credentials, OAuth tokens, payer PII
+or raw response bodies are stored. `VAULT_KEYS_JSON` is an externally provisioned
+standard-base64 32-byte key map; `VAULT_ACTIVE_KEY_ID` selects new writes and old
+IDs remain readable while retained. Missing keys or tampering fail closed. No
+bulk re-encryption or key removal tool is implemented. No actual secret files
+were opened or changed; `.env.example` contains configuration placeholders only.
+
+Durable pre-network claims ensure one setup/token POST per operation, including
+concurrent HTTP requests and restarts. Known token IDs are saved before GET
+verification and support safe GET-only recovery after restart. A timeout, crash
+or lost creation response without a known ID remains `review_required` and
+blocks fresh onboarding rather than creating another method. Both endpoint
+references document three-hour request-key retention, but this implementation
+chooses no creation-POST retries even within that window. A separate future
+operator-review procedure is required to resolve uncertain outcomes; there is no
+unsafe reset/replacement endpoint. Pre-token canceled/expired operations can be
+restarted; possibly-created tokens never expire into permission to replace them.
+Original-session revocation or expiry prevents activation; provider observations
+are still durably retained if revocation happens during I/O. A deferred guard
+rejects expiry during the final transaction and rolls activation back.
+
+New tests in `tests/test_vault.py` use only mocked HTTP and private PostgreSQL,
+cover success, cookie-less cross-site return, CSRF/origin/session rejection,
+callback forgery/replay/cancel/expiry, concurrent initiation/completion, no network
+inside transactions, lost responses, crash boundaries, known-token recovery,
+revocation during token creation, commit-time expiry, AEAD tampering/key rotation,
+logging/privacy, provider validation and migration evidence preservation. Prior
+migration-head assertion now expects `0004`; its upgrade/downgrade preservation
+checks remain intact. Verification actually completed on 2026-10-22:
+`rtk proxy .venv/bin/pytest -q --tb=line` reported **496 passed, 1 warning in
+103.21s**, including **63 Vault tests**; the warning is the existing Starlette/
+HTTPX TestClient deprecation. Offline `uv build` produced wheel and source
+archives; `uv lock --check --offline`, `compileall` and `git diff --check` passed.
+Archive inspection confirmed Vault modules are packaged and real `.env`/
+`.env.local` files are excluded. All 25 approved decisions and revisions
+`0001`–`0003` were compared against HEAD and remain unchanged.
+No persistent database migration/reset or live PayPal call was performed. See
+README's separate manual HTTPS Sandbox smoke test for actual browser, callback
+shape, customer-binding and app eligibility verification.
+
 ## 8. Channel3 feasibility — completed search and retrieval spike
 
 Evidence is the controlled experiment using `scripts/spike_channel3.py`, as reported by the project owner. The context update inspected the script without running it or contacting Channel3.
@@ -764,13 +860,13 @@ Historical schedule context: submissions opened October 1, 2026, at 9:15 AM PT; 
 | FastAPI app metadata and `GET /health` | **IMPLEMENTED; prior import/TestClient verification passed** |
 | PostgreSQL persistence / migrations / invariant tests | **IMPLEMENTED:** native SQL/Alembic, disposable PostgreSQL integration/concurrency tests; no persistent database provisioned |
 | Single-owner authentication | **IMPLEMENTED:** secure bootstrap, Argon2id login, durable sessions/revocation, CSRF and reusable owner dependencies |
-| Vault onboarding in app | **NOT IMPLEMENTED** |
+| Vault onboarding in app | **IMPLEMENTED offline:** owner initiation, Strict-cookie-safe callback/CSRF completion, independent v3 verification, AEAD storage and durable conservative recovery; real hosted-browser/provider smoke test remains pending |
 | Owner policy configuration/history and current-month budget API | **IMPLEMENTED:** authenticated, CSRF-protected writes, immutable versions and atomic immediate limits under Decision 25 |
 | Purchase proposals and initial deterministic policy evaluation | **IMPLEMENTED:** independent refresh, immutable decisions/rule traces, exact totals and context-bound durable idempotency; no HTTP routes |
 | Human purchase approval and safe inspection | **IMPLEMENTED:** owner queue/details, explicit snapshot-bound approval/denial, immutable audit, idempotency and commit-time expiry/session guard |
 | Reservation/payment dispatch services | **NOT IMPLEMENTED**; persistence and final financial integrity guards are implemented |
 | Database idempotency, accounting and retry guards | **IMPLEMENTED**; HTTP/provider orchestration and reconciliation services are **NOT IMPLEMENTED** |
-| Live PydanticAI / Channel3 / PayPal application integration | Reusable Channel3 adapter implemented but not called live in this task; agent/HTTP orchestration and PayPal integration **NOT IMPLEMENTED** |
+| Live PydanticAI / Channel3 / PayPal application integration | Reusable Channel3 adapter implemented but not called live in this task; agent orchestration and live application verification remain pending; Sandbox Vault adapter implemented with mocks, payment dispatch absent |
 | Integrated frontend / end-to-end AgentPal execution / judge-ready demo | **NOT COMPLETED** |
 | PayPal webhooks | **EXCLUDED from MVP**, not a pending integration milestone |
 
@@ -789,7 +885,7 @@ These are unresolved integration/configuration choices; approved requirements in
 | Source adapter integration | Parsing/retrieval/comparison and independent proposal refresh implemented offline; live adapter verification, runtime identity integration and pre-dispatch refresh remain pending |
 | Channel3 access and data-use restrictions | API availability for the demo/judging, terms, caching, public redistribution, benchmark/evaluation use |
 | Owner deployment and recovery | Authentication and configurable lifetime are implemented; select deployment settings/safe judge access and define owner recovery separately; no public registration |
-| Vault onboarding persistence | Setup/callback correlation and validation, verified completion, retries/cancellation, secure payment-method storage |
+| Vault deployment/live verification | Backend implemented; provision external AES keys and eligible Sandbox app, verify actual hosted callback/customer shapes and Strict cookies, and define operator review for uncertain creation outcomes |
 | Owner-selected financial values | The configuration API and validation are implemented; the owner must supply actual deployment budget/threshold/hard-limit values, with no seeded defaults |
 | Proposal TTL | The owner supplies a valid duration through the API; one TTL begins at proposal creation and existing snapshots cannot be extended |
 | Transactional services | Idempotent proposals and human decisions, owner/session locks and safe conflict handling implemented; dispatch and verified reconciliation remain pending |
@@ -802,14 +898,14 @@ These are unresolved integration/configuration choices; approved requirements in
 
 ## 14. Roadmap after persistence, authentication, policy and discovery foundations
 
-Context consolidation, all 25 decisions, PostgreSQL persistence/hardening, owner authentication/configuration, the offline-tested Channel3 foundation, idempotent proposals and secure human approval/read APIs are complete. Do not repeat those implementations, completed feasibility spikes or blank schema/adapter planning. Review existing guards/dependencies and their integration limitations before the next bounded task.
+Context consolidation, all 25 decisions, PostgreSQL persistence/hardening, owner authentication/configuration, the offline-tested Channel3 foundation, idempotent proposals, secure human approval/read APIs and offline-tested Sandbox Vault onboarding are complete. Do not repeat those implementations, completed feasibility spikes or blank schema/adapter planning. Review existing guards/dependencies and their integration limitations before the next bounded task.
 
 1. Verify real Channel3 adapter compatibility and data-use permissions in a separately authorized bounded check; offline fixtures do not establish live compatibility.
-2. Implement Vault onboarding, including callback validation and external encryption-key provisioning.
-3. Build pre-dispatch source/financial gates and durable payment/reconciliation services around existing database guards. Verify endpoint replay retention and exact payload recovery before any authorized payment test.
+2. Separately authorize the documented manual HTTPS Sandbox Vault smoke test and external key provisioning; do not treat mocks or the historical spike as proof of the new adapter/browser flow.
+3. Smallest next backend implementation: build a pre-dispatch readiness/source/financial eligibility service without sending payment HTTP. Then implement durable payment/reconciliation services around existing database guards. Verify endpoint replay retention and exact payload recovery before any authorized payment test.
 4. Integrate PydanticAI and the frontend; verify end-to-end execution and prepare the public licensed source, setup/judging access and concise English demonstration.
 
-The implemented foundations include reusable source retrieval, durable initial proposals and owner purchase-read/human-approval endpoints, but no discovery HTTP/AI runtime, checkout, payment execution, frontend or end-to-end purchasing system.
+The implemented foundations include reusable source retrieval, durable initial proposals and owner purchase-read/human-approval endpoints and Sandbox Vault onboarding, but no discovery HTTP/AI runtime, checkout, payment execution, frontend or end-to-end purchasing system.
 
 ---
 

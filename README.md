@@ -6,8 +6,8 @@ single demo Business account. The application does not order or fulfill goods
 from those retailers. The FastAPI health endpoint, PostgreSQL persistence and
 single-owner authentication, owner policy/budget APIs and a reusable Channel3
 discovery/transient-selection foundation and durable initial purchase proposals
-and secure owner purchase approval are implemented. Reservation and payment
-execution services are pending.
+and secure owner purchase approval and PayPal Sandbox Vault onboarding are
+implemented. Reservation and payment execution services are pending.
 
 The [authoritative context](docs/AgentPal_Full_Context_Handoff.md) records approved
 decisions, completed experiments and remaining integration work.
@@ -40,7 +40,7 @@ is seeded. `alembic downgrade` destroys persisted state and is for intentionally
 disposable databases only.
 
 ```sh
-rtk proxy uv run uvicorn agentpal.main:app --reload
+rtk proxy uv run uvicorn agentpal.main:app --reload --no-access-log
 rtk proxy uv run pytest -q
 ```
 
@@ -439,10 +439,214 @@ result.raise_for_status()
 result.json()  # Consent and payment state are separate.
 ```
 
-PayPal Vault onboarding, dispatch/recovery and reconciliation services remain pending.
+PayPal Vault onboarding is implemented below; payment dispatch/recovery and
+reconciliation services remain pending.
 Every eventual Sandbox payment still goes to AgentPal's single Business account,
 not the catalog retailer. Approval places no real retailer order and guarantees no
 physical stock or fulfillment. No live Channel3 or PayPal API is called by these routes.
+
+## PayPal Sandbox Vault onboarding
+
+This owner-only backend connects one Sandbox payer payment source. It does not
+approve a purchase, reserve budget, place an order, capture funds or change the
+receiving merchant. The configured Sandbox Business application's credentials
+identify AgentPal's merchant; the returned Vault customer is the payer. Neither
+payer/customer references nor callback parameters set `sandbox_business_account_id`.
+There are no AI authorization tools or frontend pages in this slice.
+
+### Configuration and encrypted storage
+
+Apply reviewed forward migration `0004` only to a database you are authorized to
+migrate. The implementation tests use disposable databases; no persistent database
+has been migrated by this work. Existing runtime table grants already cover the
+extended `vault_setups` columns and `payment_methods`; no new table grants are needed.
+
+Export settings privately through your deployment's secret configuration, with
+no automatic dotenv loading. `.env.example` contains placeholders only:
+
+| Variable | Required value / purpose |
+|---|---|
+| `PAYPAL_ENVIRONMENT` | Exactly `sandbox`; there is no live mode |
+| `PAYPAL_BASE_URL` | Exactly `https://api-m.sandbox.paypal.com` |
+| `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | Private Sandbox Business REST application credentials with Vault enabled |
+| `VAULT_ACTIVE_KEY_ID` | Identifier of the encryption key used for new writes |
+| `VAULT_KEYS_JSON` | JSON object mapping key identifiers to standard-base64 encoded, independently random 32-byte AES keys |
+| `VAULT_TTL_SECONDS` | Browser onboarding deadline, default 1200 seconds; allowed 120–3600; distinct from purchase TTL |
+| `AUTH_ORIGIN`, `DATABASE_URL` | Existing exact browser-origin and private database configuration |
+
+Provision keys using an OS cryptographic generator in your secret manager; never
+use a sample key, derive one from a password, print it into reports, or store it
+in PostgreSQL. Keep the mapping private and back it up separately from database
+backups. AES-256-GCM uses fresh 96-bit nonces and authenticated associated data
+including envelope version, setup UUID, purpose and key ID. Setup requests,
+setup/customer/approval references, token-recovery references and the final
+payment-method reference are encrypted with separate purposes. State and browser
+receipt are purpose-separated SHA-256 hashes. OAuth tokens stay in memory only.
+No payer address, email, password or raw provider response is persisted.
+
+Rotation: retain old key IDs for reads, add a new independently generated key,
+then switch `VAULT_ACTIVE_KEY_ID` for new writes. Existing ciphertext is immutable;
+this task does not re-encrypt history or remove old keys. Removing a key makes its
+references unreadable and fails closed. Losing the keys loses recovery capability.
+
+### Endpoint contracts and browser return
+
+| Endpoint | Contract |
+|---|---|
+| `POST /paypal/vault/start` | Original owner session, exact origin and `X-CSRF-Token`; empty body or `{}`. Returns `onboarding_id`, `state`, `expires_at`, plus `approval_url` only while that session can navigate to PayPal. Duplicate starts reuse the open operation. Existing active method returns 409. |
+| `GET /paypal/vault/status` | Authenticated owner; returns `{connected, onboarding}`. Onboarding contains only its internal UUID, state and deadline. No approval/provider URLs or references. `connected` means previously verified and not locally revoked, not a fresh provider availability check. |
+| `GET /paypal/vault/return` and `/cancel` | Public browser-return endpoints; require unconsumed cryptographic `state`, original active session record and unexpired flow. They need no owner cookie on this initial cross-site navigation. |
+| `GET /paypal/vault/returned` | Query-free JSON landing message; no authentication or completion authority. |
+| `POST /paypal/vault/{onboarding_id}/complete` | Original active owner session, exact origin, CSRF and HttpOnly return-receipt cookie; empty body or `{}`. Independently verifies and finishes the operation. Repeating a completed operation returns its safe `complete` state. |
+
+Writes reject caller-selected provider IDs, URLs, session IDs and arbitrary JSON.
+Errors are generic 400/401/403/404/409/503 without input or provider echoes.
+All Vault responses are no-store, nosniff and no-referrer, with a restrictive CSP.
+The necessary PayPal navigation URL is the only public exception to keeping setup
+references server-side: treat it as sensitive, navigate directly, and never log,
+render through analytics, persist in frontend storage or include it in reports.
+A future frontend must also set its document referrer policy to `no-referrer`.
+
+The browser may omit the Strict owner cookie when PayPal redirects back. The
+callback checks stored state and consumes it exactly once, sets a separate
+Secure/HttpOnly/SameSite=Strict receipt, and sends a 303 to the fixed same-origin
+query-free landing endpoint. It never authenticates the browser or creates an
+owner session. The user must return to AgentPal in a fresh same-origin navigation
+and explicitly complete with the original session and CSRF. No owner cookie is
+changed to Lax/None. A different login/session cannot take over the operation.
+Cancel records `canceled` without a token-creation POST; expired or replayed
+callbacks are rejected. A lost return receipt cannot be recovered by replaying a
+callback; a pre-token flow may expire and then be started afresh.
+
+Only `state` is required from the return URL we supply. Optional
+`approval_token_id`, `approval_session_id` or `token` must, when present, equal
+the stored setup ID. Duplicates, unknown fields and mismatches fail closed.
+These optional aliases are defensive checks, not claims about guaranteed PayPal
+callback fields. The real hosted callback shape still needs the smoke test below.
+
+The application removes callback query data from the ASGI request scope before
+Uvicorn response-time access logging and filters this integration's HTTPX/httpcore
+logs. Run with `--no-access-log` and configure every upstream proxy, tracing/error
+collector and browser analytics layer to omit callback query strings, cookies,
+request/response bodies and PayPal URLs. An application cannot redact a proxy's
+request log after that proxy has already recorded it. Do not export browser HARs
+or capture developer-tool screenshots containing references or credentials.
+
+### Provider lifecycle, duplicate control and recovery
+
+The fixed-origin, no-redirect HTTP adapter performs only:
+
+1. OAuth `POST /v1/oauth2/token` with client credentials, kept server-side.
+2. `POST /v3/vault/setup-tokens` with a PayPal wallet, `usage_type=MERCHANT`,
+   `customer_type=CONSUMER`, and return/cancel URLs derived from `AUTH_ORIGIN`.
+3. Browser navigation to the single validated Sandbox `approve` link. The
+   allowlist is HTTPS `sandbox.paypal.com` or `www.sandbox.paypal.com`, path
+   `/agreements/approve`, with exactly the matching `approval_session_id` query.
+4. On authenticated completion, `GET /v3/vault/setup-tokens/{stored_id}` must
+   return the matching ID/customer, PayPal source and `APPROVED` status.
+5. `POST /v3/vault/payment-tokens` with
+   `payment_source.token={id: stored_setup_id, type: SETUP_TOKEN}`.
+6. Persist encrypted returned ID/customer before
+   `GET /v3/vault/payment-tokens/{stored_id}` verifies matching ID/customer and a
+   PayPal source. Only then atomically record verified setup, encrypted method
+   and owner audit attribution. The payment-token response has no invented
+   approval/status requirement.
+
+OAuth is acquired per provider operation; no credential-bearing client persists
+between operations. Requests disable environment proxies and redirects, validate
+IDs and JSON shape, bound decoded bodies to 64 KiB, and use 5-second connect and
+10-second I/O timeouts plus a 20-second streamed-response deadline check. No
+network request holds a database transaction. No Orders or Capture API exists here.
+
+State progression is `setup_post → awaiting_payer → returned → token_post →
+verifying_token → complete`, with `canceled`, `expired` and `review` branches.
+Database owner/session locks, a unique open-flow index, stable per-endpoint UUID
+request IDs and once-set encrypted observations prevent uncontrolled parallel
+creation or replacement. Session/origin/CSRF are rechecked after I/O, and a
+deferred database guard rechecks expiry, session and method evidence at commit.
+
+The public states `review_required`, `completion_required` and
+`verification_required` distinguish an unresolved creation claim, a return needing
+provider checks and a known token needing read-only verification. A duplicate
+request during an in-flight creation also reports `review_required`; it does not
+start another POST. This conservative status remains safe after a process crash.
+
+Both [setup-token creation](https://developer.paypal.com/api/payment-tokens/v3/setup-tokens-create/)
+and [payment-token creation](https://developer.paypal.com/api/payment-tokens/v3/payment-tokens-create/)
+document three-hour request-key storage. **This implementation never retries either
+creation POST**, even within that window. An uncertain response or crash without
+a durably stored provider ID blocks fresh onboarding and requires operator review;
+there is no reset/replacement/review-resolution API in this slice. Do not delete
+rows or change request IDs to bypass it. Durable known payment-token IDs support
+repeated authenticated GET verification after restart without another POST.
+Provider failures before token creation can be retried through safe setup GETs;
+malformed or uncertain creation results remain under review. Expiry cannot release
+an uncertain or already-created token for replacement. Revoked original sessions
+cannot complete; retained encrypted observations remain available for later review.
+The [official no-purchase guide](https://developer.paypal.com/api/payment-tokens/save-without-purchase/paypal)
+and [v3 specification](https://developer.paypal.com/api/payment-tokens/v3/schema.json)
+are the contract references; mocked fixtures are not live compatibility evidence.
+
+### Manual Sandbox smoke test — separate, not yet executed
+
+Use a separately authorized isolated Sandbox environment, never a production
+account or database. Confirm the Business REST application has Vault/billing
+agreement eligibility and use a distinct Sandbox Personal payer. Privately
+provision credentials/keys, an authorized migrated database and the existing owner
+login. Use a reachable HTTPS `AUTH_ORIGIN` with trusted TLS and redacted upstream
+logs. Explicit HTTP-loopback development is permitted by authentication settings
+but uses insecure development cookie names; it does not establish hosted PayPal
+redirect acceptance or real-browser Secure/Strict behavior.
+
+1. Start one backend worker with access logging disabled. Open its same-origin
+   `/docs`, then use `/auth/login` to establish the existing owner session. Never
+   paste credentials into a console script, shell command, report or recording.
+2. In that origin's browser console, obtain only the purpose-specific CSRF cookie
+   and initiate without logging the response or provider URL:
+
+   ```javascript
+   const csrf = decodeURIComponent(document.cookie.split('; ').find(x => x.startsWith('__Host-agentpal_csrf=')).split('=')[1]);
+   const started = await (await fetch('/paypal/vault/start', {
+     method: 'POST', credentials: 'same-origin',
+     headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: '{}'
+   })).json();
+   if (started.state === 'awaiting_payer') location.assign(started.approval_url);
+   ```
+
+3. Authenticate as the distinct Sandbox payer and approve saving the method.
+   Verify a clean fixed `/paypal/vault/returned` location after the redirect.
+   Check Strict-cookie behavior locally without exporting network traces: the
+   initial callback must succeed even if the owner cookie is absent. Verify no
+   owner-session cookie is created by that callback. If the real callback shape
+   is rejected, stop and inspect privately against current official documentation;
+   do not loosen validation or substitute an ID manually.
+4. Navigate freshly to the same-origin `/docs`, preserving the original owner
+   session and return receipt. Run the following without logging provider data:
+
+   ```javascript
+   const csrf = decodeURIComponent(document.cookie.split('; ').find(x => x.startsWith('__Host-agentpal_csrf=')).split('=')[1]);
+   const status = await (await fetch('/paypal/vault/status')).json();
+   const completed = await (await fetch(`/paypal/vault/${status.onboarding.onboarding_id}/complete`, {
+     method: 'POST', credentials: 'same-origin',
+     headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: '{}'
+   })).json();
+   // Inspect only completed.state and sanitized /paypal/vault/status.
+   ```
+
+5. Require `complete` and `connected=true`. Repeating completion must remain
+   complete; starting again must return 409. Verify only encrypted references and
+   safe audit transitions exist using a trusted local inspection that never prints
+   ciphertext/plaintext references or keys. Confirm the receiving Business account
+   was not overwritten with payer/customer data. Record only safe outcomes.
+6. In a separate fresh test environment, exercise cancellation, duplicate callback,
+   expired state and restart after a known-token verification failure. Stop on
+   `review_required`; investigate privately rather than issuing another creation
+   request. Do not deliberately lose live creation responses just to test retries.
+
+This smoke test saves a Sandbox method only. Do not run spike charge commands,
+Orders, Capture, dispatch or any payment. Browser behavior, callback aliases,
+returned customer binding, app eligibility and live provider response shapes remain
+unverified until this explicit manual check succeeds.
 
 ## Single-owner authentication
 
@@ -461,7 +665,7 @@ The equivalent module entry point is `rtk proxy uv run python -m agentpal.auth.b
 Only the requested owner and a safe audit event are inserted; there are no seeded
 policies, limits, PayPal references or default credentials. Bootstrap needs the
 database URL but does not need browser-origin settings. Authentication reuses the
-existing schema; apply the current migration head (`0003`) for approval commit checks.
+existing schema; apply the current migration head (`0004`) for approval and Vault completion guards.
 
 All configuration is read from exported environment variables, never automatically
 from `.env` or `.env.local`:
@@ -686,7 +890,9 @@ hides such overspending to make the budget appear within its cap.
 
 Alembic is the migration coordinator. `migrations/versions/0001_persistence.sql`
 defines the initial PostgreSQL schema; additive revision `0002` hardens lifecycle,
-capture accounting and limit updates, and `0003` adds approval commit checks. SQLAlchemy Core
+capture accounting and limit updates, `0003` adds approval commit checks, and
+`0004` adds durable Vault flow claims, encrypted recovery evidence and completion
+guards. Downgrade of `0004` refuses to discard managed onboarding evidence. SQLAlchemy Core
 and psycopg provide connections; there is no duplicate, incomplete ORM schema
 or autogeneration workflow. Create subsequent reviewed Alembic revisions for
 schema changes. Application connections use READ COMMITTED isolation and hide
