@@ -7,7 +7,8 @@ from those retailers. The FastAPI health endpoint, PostgreSQL persistence and
 single-owner authentication, owner policy/budget APIs and a reusable Channel3
 discovery/transient-selection foundation and durable initial purchase proposals
 and secure owner purchase approval and PayPal Sandbox Vault onboarding are
-implemented. Reservation and payment execution services are pending.
+implemented. Trusted pre-dispatch readiness now reserves shared budget and
+prepares an unsent payment; payment execution and reconciliation remain pending.
 
 The [authoritative context](docs/AgentPal_Full_Context_Handoff.md) records approved
 decisions, completed experiments and remaining integration work.
@@ -315,9 +316,9 @@ is already committing, it must retry the same reference/quantity to discover the
 durable outcome. A fresh reference creates a new proposal identity and proves
 nothing about recovery or replay of an uncertain PayPal payment.
 
-Remaining work includes pre-dispatch source refresh,
-final atomic financial eligibility/reservation, Vault setup and durable payment/
-reconciliation orchestration. No PayPal API is called here. Eventual payments go
+Source refresh, atomic financial preparation/reservation and Vault onboarding
+are implemented in the sections below. Actual payment dispatch and
+reconciliation orchestration remain separate future work. No PayPal API is called here. Eventual payments go
 to **AgentPal's single PayPal Sandbox Business account**, not the catalog retailer;
 there is no retailer checkout, guaranteed stock or goods fulfillment. Before
 end-to-end judging, the previously documented live Channel3 price aliases, optional
@@ -445,6 +446,164 @@ Every eventual Sandbox payment still goes to AgentPal's single Business account,
 not the catalog retailer. Approval places no real retailer order and guarantees no
 physical stock or fulfillment. No live Channel3 or PayPal API is called by these routes.
 
+## Trusted pre-dispatch financial readiness
+
+`agentpal.readiness` prepares financial state for an existing immutable proposal.
+It adds no HTTP endpoint or AI runtime and sends no PayPal requests. Prepared,
+potentially dispatched and completed payments remain separate states. No new
+human approval workflow or financial policy defaults are introduced.
+
+### Internal contracts and trust boundary
+
+Construct `ReadinessService(engine, channel3_client, ReadinessSettings(...))` in
+the trusted backend with the existing fixed-origin Channel3 adapter. The engine
+uses PostgreSQL and the existing runtime grants; deployment settings and runtime
+context never come from AI arguments. Configuration reads exported variables
+only, with `env_file=None`:
+
+| Setting | Contract |
+|---|---|
+| `PAYPAL_ENVIRONMENT` | Required, exactly `sandbox` |
+| `PAYPAL_SANDBOX_MERCHANT_ID` | Required single Business merchant account ID, matching `owners.sandbox_business_account_id`; never an email, list, catalog merchant, payer ID or Vault customer ID |
+| `READINESS_MAX_SOURCE_AGE_SECONDS` | Default 30, allowed 1–120; technical age bound for committing a preparation check, not purchase TTL or future dispatch permission |
+
+The merchant-ID format follows the [official PayPal payee contract](https://developer.paypal.com/sdk/orders/v2/definitions/payee).
+Matching configuration and database values is a local check; it does not prove
+which Business account owns actual REST credentials. Privately confirm that
+association before deployment. This service never creates or changes the payee.
+The existing database freezes that recipient once any payment is prepared.
+
+| Method | Contract |
+|---|---|
+| `await prepare(context: RunContext, purchase_id: UUID) -> ReadinessResult` | Trusted server-owned owner/agent/run context bound to the proposal's immutable provenance audit; requires an enabled owned agent. No browser session, amount, merchant, method, approval identity or retry policy argument. |
+| `release_unsent(context: RunContext, purchase_id: UUID) -> ReadinessResult` | Synchronous trusted abandonment/recovery action; may release for a disabled agent while still verifying original ownership/run binding. Do not expose this capability as an AI tool. |
+| `result.public()` | Allowlisted internal UUIDs, state/reasons, original period, exact decimal-string amount, USD, authorization kind and replay flag. `execution_ready` is always false. No provider IDs, payee, Vault references, ciphertext, keys or arbitrary JSON. |
+
+Reuse the context created by the existing trusted proposal launcher. A future
+purchase-tool wrapper may close over that context and accept only a proposal
+UUID. Constructing/deserializing `RunContext` from AI-supplied identity fields is
+not authentication. On restart restore original run identity from trusted durable
+provenance, not a new run claim. An authenticated owner does not give an agent
+human approval power. Previously recorded owner consent remains immutable after
+logout; readiness does not require passing a browser cookie into an auto-authorized
+run. A missing or inconsistent provenance audit fails closed.
+
+`ReadinessError.code` is a fixed safe code. Context/type misuse returns
+`CONTEXT_REJECTED`; serialization, deadlock and uniqueness aborts return
+`TRANSACTION_CONFLICT`; eligibility constraint failures return
+`READINESS_CONFLICT`; other storage failures return `READINESS_STORAGE_UNAVAILABLE`.
+Retry the same purchase after inspecting state. No provider POST retry is implied.
+
+### Source, authorization and transaction lifecycle
+
+A short financial transaction first verifies context and an existing preparation.
+For a new preparation, all database connections are released before independent
+Channel3 `GET /v1/products/{stored_id}`. Existing `compare_offer` rules require
+unchanged product, exact canonical merchant, complete URL fingerprint, nullable
+condition, matching version, unique USD price and explicit `InStock`. Both price
+increases and decreases invalidate the old proposal. Missing, ambiguous,
+unavailable, unsupported and substituted data cannot authorize preparation.
+Timeout/rate limiting never fall back to cached observations.
+
+The final transaction takes the existing `lock_finances()` owner revision lock,
+then agent/reservation and selected method locks. It rechecks the stored proposal,
+active policy, original TTL, allowlist, hard limit, automatic threshold or bound
+human approval, denial, prior definitive source invalidation, configured payee
+and exactly one verified non-revoked method. It records immutable source evidence
+and fixed failure reasons. Source errors remain retryable with a fresh retrieval;
+definitive identity/price/availability invalidation requires a new proposal under
+the existing database rules.
+
+Using the authoritative `budget_balances` view, it initializes the current UTC
+period on demand and atomically inserts one exact hold and one `payments` row in
+`prepared` state. Full captures replace their holds in the existing view; partial,
+extra and unknown outcomes retain existing conservative protection. No parallel
+in-memory balance exists. Payment amount/currency/policy/approval remain bound
+through the immutable purchase, and payment method/payee and preparation evidence
+are immutable. A `payment_prepared` system audit records snapshot, policy, period,
+source-check ID, authorization kind and exact money, without provider secrets.
+
+A preparation has **no payment operation**: no fake HTTP payload, encryption
+metadata, request ID, retry window, transmission marker, provider order, capture
+or result is inserted. The final executor must construct actual encrypted request
+bytes and documented endpoint-specific replay policy later. Preparation does not
+decrypt Vault references; the executor must validate/decrypt the selected method
+using its retained external keys before claiming dispatch.
+
+Revision `0005_readiness.py` is necessary because previous insert-time checks
+could commit a reservation after proposal expiry, one row lock could not exclude
+another active method being inserted, and the old release guard considered only
+a dispatch timestamp. It adds a bound revalidation ID/technical deadline on new
+managed payment rows, deferred authorization/method/budget/source-age checks,
+statement-level financial locking before method insert/revoke, explicit human
+consent checks for awaiting proposals, and strict unsent-release proof. Existing
+captures, balances and migration history are preserved. Legacy rows have nullable
+preparation metadata and are not silently adopted by the new service. New helper
+functions revoke PUBLIC execution; after an authorized upgrade, reapply the
+existing runtime `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA agentpal` grant as the
+migration administrator. Runtime roles need no DDL, DELETE or schema ownership.
+No persistent database was migrated during implementation.
+
+### Idempotency, release and crash recovery
+
+| Observed state | Meaning / next action |
+|---|---|
+| `BLOCKED` | No new financial obligation; inspect fixed reasons. Source evidence/audit may be durable. |
+| `PREPARED_UNSENT` | One committed payment/hold exists. This is durable preparation history, not standing authority to send HTTP. |
+| `RELEASED_UNSENT` | The original hold was released after proving no dispatch/provider activity. Payment stays `prepared` as historical evidence; reservation state determines release. This purchase cannot acquire another hold or payment. Use a new proposal if purchasing again. |
+| `EXISTING_FINANCIAL_STATE` | Legacy/orphaned state cannot be adopted automatically. Trusted recovery can release a reservation with no payment record if definitely unsent. |
+| `EXISTING_PAYMENT` | Dispatch/provider activity or a later payment lifecycle exists; readiness does not refresh, replace, release or reconcile it. |
+| `NOT_PREPARED` | Explicit abandonment found no obligation to release. |
+
+Same-purchase replay returns the original payment and accounting period before
+new source I/O. It neither duplicates holds/audits nor manufactures freshness.
+An expired proposal, superseded policy, revoked/changed/ambiguous method or known
+source invalidation releases an existing managed preparation only when it is
+provably unsent. Explicit `release_unsent` handles abandonment and disabled-agent
+cleanup. A prepared operation with zero attempts can still be released; its
+future dispatch claim then fails the held-reservation guard. Any dispatch count,
+first-dispatch time, provider order, observation, capture or later lifecycle
+blocks this release path. Possibly dispatched payments retain their funds and
+recovery identity even after TTL/policy changes. Readiness performs no provider
+reconciliation and does not invent no-charge evidence.
+
+Crash before refresh or before the final transaction leaves no new obligation.
+A failure during the transaction rolls back source evidence, hold, payment and
+preparation audit together. After commit, a lost response/restart resolves through
+the same purchase/context and returns the same payment/period. Cancellation of an
+async caller does not prove its database worker rolled back; replay the same
+purchase. Renewal never moves an existing obligation into a new month.
+No background worker automatically releases abandoned holds: the trusted runtime
+must call the explicit recovery action, including before a budget decrease that
+would otherwise undercut reserved protection.
+
+### Future dispatch boundary and verification limits
+
+Immediately before actual execution, the future executor must freshly retrieve
+and compare the source, repeat policy/TTL/consent/method/payee/financial checks,
+construct and encrypt the real request, verify endpoint replay rules and atomically
+claim the existing operation/reservation. Commit the claim before HTTP and record
+only actual provider outcomes afterward. Once a claim may have been transmitted,
+retain protection until verified reconciliation. Source observations cannot lock
+retailer data or prove live checkout price, physical stock or fulfillment. The
+30-second preparation bound is not a retailer freshness guarantee or permission
+to reuse that evidence for later dispatch. Zero-value preparation is representable;
+actual provider handling remains a separate execution decision.
+
+Tests use mocked Channel3 and disposable PostgreSQL, including competing agents,
+same-purchase preparation, policy/budget/Vault races, commit expiry/source age,
+release versus SQL dispatch claims, crash rollback, runtime-role grants and
+capture accounting. No live Channel3, PayPal Vault, Orders or Capture API is called.
+Live adapter compatibility, Vault browser/customer behavior and association of the
+configured merchant with the actual Sandbox app still require separate authorized
+verification. No payment, frontend, agent orchestration or end-to-end purchasing
+system is completed by this layer.
+
+Readiness verification: `rtk proxy .venv/bin/pytest -q --tb=line` reported
+**577 passed, 1 existing warning**, including 81 readiness cases. Offline wheel/
+source builds, lockfile, compilation and whitespace checks passed. All providers
+were mocked and no persistent database was migrated.
+
 ## PayPal Sandbox Vault onboarding
 
 This owner-only backend connects one Sandbox payer payment source. It does not
@@ -456,8 +615,8 @@ There are no AI authorization tools or frontend pages in this slice.
 
 ### Configuration and encrypted storage
 
-Apply reviewed forward migration `0004` only to a database you are authorized to
-migrate. The implementation tests use disposable databases; no persistent database
+Apply the reviewed migration head (`0005`, including Vault revision `0004`) only
+to a database you are authorized to migrate. The implementation tests use disposable databases; no persistent database
 has been migrated by this work. Existing runtime table grants already cover the
 extended `vault_setups` columns and `payment_methods`; no new table grants are needed.
 
@@ -665,7 +824,7 @@ The equivalent module entry point is `rtk proxy uv run python -m agentpal.auth.b
 Only the requested owner and a safe audit event are inserted; there are no seeded
 policies, limits, PayPal references or default credentials. Bootstrap needs the
 database URL but does not need browser-origin settings. Authentication reuses the
-existing schema; apply the current migration head (`0004`) for approval and Vault completion guards.
+existing schema; apply the current migration head (`0005`) for approval, Vault and financial preparation guards.
 
 All configuration is read from exported environment variables, never automatically
 from `.env` or `.env.local`:
@@ -892,7 +1051,8 @@ Alembic is the migration coordinator. `migrations/versions/0001_persistence.sql`
 defines the initial PostgreSQL schema; additive revision `0002` hardens lifecycle,
 capture accounting and limit updates, `0003` adds approval commit checks, and
 `0004` adds durable Vault flow claims, encrypted recovery evidence and completion
-guards. Downgrade of `0004` refuses to discard managed onboarding evidence. SQLAlchemy Core
+guards. Revision `0005` binds preparation checks and hardens commit/release/method
+serialization. Downgrades of `0004`/`0005` refuse to discard managed evidence. SQLAlchemy Core
 and psycopg provide connections; there is no duplicate, incomplete ORM schema
 or autogeneration workflow. Create subsequent reviewed Alembic revisions for
 schema changes. Application connections use READ COMMITTED isolation and hide
@@ -1026,10 +1186,10 @@ future financial services must use its verified owner context, independently
 obtain source/provider evidence, encrypt sensitive
 references and the exact replayable request bytes, and sanitize observation/audit
 JSON. Never expose stored Vault/session material or arbitrary JSON through an API.
-Onboarding callback handling, encryption/key provisioning, password recovery,
-deployment-specific session lifetime selection, source URL/condition matching fixtures, Channel3 retention
-permissions, replay-window verification and all financial configuration values
-remain explicit integration work. Description text is not needed in financial
+Vault callback handling and encryption are implemented above; external key
+provisioning, password recovery, deployment-specific session lifetime selection,
+live source compatibility/data-use permissions, endpoint replay-window verification
+and actual owner financial configuration remain deployment/integration work. Description text is not needed in financial
 snapshots; a URL fingerprint is a conservative comparison guard, not a provider
 offer ID or an exemption from data-use terms. Source observations do not prove
 live checkout price, legal seller identity, physical stock or fulfillment.

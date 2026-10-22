@@ -305,7 +305,7 @@ def test_additive_migration_preserves_committed_facts_and_reproduces_guards(db, 
         assert c.execute(text("SELECT reserved_amount,spent_amount FROM agentpal.budget_balances")).one() == (40,40)
         command.upgrade(config, "head")
         command.upgrade(config, "head")
-        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         assert c.scalar(text("SELECT count(*) FROM agentpal.payment_captures WHERE payment_id=:pay"), {"pay": pay}) == 1
         assert c.execute(text("SELECT reserved_amount,spent_amount FROM agentpal.budget_balances")).one() == (0,40)
 

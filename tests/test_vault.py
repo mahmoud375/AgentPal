@@ -502,7 +502,7 @@ def test_guarded_downgrade_preserves_onboarding_evidence(flow, db):
         command.downgrade(cfg, "0003")
     with db.connect() as c:
         assert c.scalar(text("SELECT id FROM agentpal.vault_setups")) == UUID(identifier)
-        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert c.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
 
 
 @pytest.mark.parametrize("failure", ["bad_link", "bad_id", "malformed_json", "large", "provider_error"])
