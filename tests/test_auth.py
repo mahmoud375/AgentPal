@@ -345,6 +345,41 @@ def test_interactive_cli_bootstrap_never_prints_password_or_hash(db, monkeypatch
     assert bootstrap.main() == 1
 
 
+@pytest.mark.parametrize("name", ["owner with spaces", "owner/invalid"])
+def test_cli_invalid_login_is_specific_and_never_prompts_for_password(db, monkeypatch, capsys, name):
+    monkeypatch.setattr(sys, "argv", ["agentpal-bootstrap"])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(bootstrap, "DatabaseSettings", lambda: object())
+    monkeypatch.setattr(bootstrap, "create_database_engine", lambda _: db)
+    monkeypatch.setattr("builtins.input", lambda _: name)
+    monkeypatch.setattr(bootstrap.getpass, "getpass", lambda _: pytest.fail("Invalid login must fail before password entry"))
+    assert bootstrap.main() == 2
+    output = capsys.readouterr()
+    assert "Invalid Owner login" in output.err
+    assert name not in output.out + output.err
+    with db.connect() as c:
+        assert not c.scalar(text("SELECT EXISTS(SELECT 1 FROM agentpal.owners)"))
+
+
+@pytest.mark.parametrize("password", ["short", "x" * 129])
+def test_cli_invalid_password_length_is_specific_and_not_persisted(db, monkeypatch, capsys, password):
+    monkeypatch.setattr(sys, "argv", ["agentpal-bootstrap"])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(bootstrap, "DatabaseSettings", lambda: object())
+    monkeypatch.setattr(bootstrap, "create_database_engine", lambda _: db)
+    monkeypatch.setattr("builtins.input", lambda _: "owner")
+    entries = iter([password])
+    monkeypatch.setattr(bootstrap.getpass, "getpass", lambda _: next(entries))
+    assert bootstrap.main() == 2
+    output = capsys.readouterr()
+    assert "Invalid Owner password: use 15" in output.err
+    assert password not in output.out + output.err
+    with db.connect() as c:
+        assert not c.scalar(text("SELECT EXISTS(SELECT 1 FROM agentpal.owners)"))
+
+
 def test_cli_rejects_piped_input_and_password_arguments_without_echo(monkeypatch, capsys):
     monkeypatch.setattr(sys,"argv",["agentpal-bootstrap","--password","do-not-echo-canary"])
     assert bootstrap.main() == 2

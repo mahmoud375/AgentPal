@@ -12,8 +12,11 @@ from agentpal.auth.passwords import hash_password
 from agentpal.db import DatabaseSettings, create_database_engine
 
 
+_LOGIN_NAME = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
+
+
 def bootstrap_owner(engine: Engine, login_name: str, password: str) -> bool:
-    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", login_name):
+    if not _LOGIN_NAME.fullmatch(login_name):
         raise ValueError("Use 1 to 128 letters, digits or . _ @ - for the login name")
     encoded = hash_password(password)
     with engine.begin() as c:
@@ -43,9 +46,15 @@ def main() -> int:
                 print("Owner already exists; unchanged.", file=sys.stderr)
                 return 1
         name = input("Owner login name: ")
+        if not _LOGIN_NAME.fullmatch(name):
+            print("Invalid Owner login: use 1–128 letters, digits or . _ @ -; nothing changed.", file=sys.stderr)
+            return 2
         with warnings.catch_warnings():
             warnings.simplefilter("error", getpass.GetPassWarning)
             password = getpass.getpass("Owner password (15–128 characters): ")
+            if not 15 <= len(password) <= 128:
+                print("Invalid Owner password: use 15–128 characters; nothing changed.", file=sys.stderr)
+                return 2
             confirmation = getpass.getpass("Confirm password: ")
         if password != confirmation:
             print("Passwords did not match; nothing changed.", file=sys.stderr)
