@@ -13,6 +13,124 @@ with an explicit agreement gate. New owner onboarding requests and verifies the
 supported agreement; legacy or insufficient provider evidence remains blocked.
 Payment execution and reconciliation remain pending.
 
+## Owner workspace and shopping MVP
+
+React/TypeScript now provides Owner login/logout, read-only PayPal connection
+status, policy configuration, budget visibility, shopping requests, durable
+proposal history, and explicit human approval/denial. FastAPI serves the built
+frontend at `/` on the same origin as the existing cookie/CSRF APIs. There is no
+registration, browser credential storage, CORS relaxation, payment button, or
+automatic Vault enrollment. All payment execution remains disabled, including
+when an agreement is verified. An approval is consent, not payment.
+
+The PydanticAI pipeline makes two bounded structured model calls: interpret a
+request into a search query/quantity, then select one backend-issued offer
+reference. The backend independently refreshes the selection and calls the
+existing `ProposalService` for exact totals, durable policy evaluation and
+immutable snapshots. Models receive no Owner session, backend credentials,
+policy write access, approval tool, payment tool, or caller-selected provider
+URL. Product titles remain untrusted text. The backend rechecks the active
+Owner session after model work. A process-wide admission limit permits one
+shopping run at a time; continue using exactly one Uvicorn worker.
+
+New authenticated endpoints are `GET /shopping/status`, CSRF-protected
+`POST /shopping/runs` (`{"request":"Find a wireless keyboard"}`), and paginated
+`GET /purchases?limit=20&offset=0`. Existing policy, approval, auth and Vault API
+contracts remain unchanged. On a lost response or timeout, refresh purchase
+history before intentionally submitting a new run. There is no automatic retry
+or durable request-level idempotency for a new natural-language shopping run;
+existing offer-reference proposal idempotency is preserved.
+
+### Run the offline vertical slice
+
+Build from this checkout, with Node.js 22.12+ and the existing Python/PostgreSQL
+tools. No persistent database migration, private runtime file or provider key
+is needed:
+
+```sh
+rtk proxy uv sync --locked
+rtk proxy npm --prefix frontend ci
+rtk proxy npm --prefix frontend run build
+```
+
+For the interactive rehearsal, invoke Python **directly**, without `rtk proxy`:
+the existing RTK wrapper interferes with private terminal streams. The command
+requires a TTY and asks you to choose/confirm a disposable password privately.
+Never enter the real Owner or PostgreSQL password here.
+
+```sh
+.venv/bin/python -I -B -m agentpal.demo
+```
+
+Open `http://127.0.0.1:8010`, sign in as `demo-owner` using that disposable
+password, and try these requests:
+
+| Request | Synthetic listing | Real backend outcome |
+|---|---|---|
+| Find a wireless keyboard | $65.00 | Awaits human approval; use **Approve proposal** or **Deny** |
+| Find an ergonomic mouse | $24.00 | Auto-authorized proposal; payment remains `NOT_STARTED` |
+| Find a monitor | $349.00 | Rejected by the hard purchase limit |
+
+The prominent **Offline rehearsal** banner identifies the scripted PydanticAI
+`TestModel` and synthetic Channel3 HTTP fixtures. This is **not evidence of live
+AI reasoning, live product retrieval, verified consent or a successful PayPal
+payment**. PostgreSQL migrations, auth, source parser/refresh, policy evaluation,
+proposal writes, immutable approval checks and history are real application
+code. Its example policy ($500 monthly, $50 auto, $150 hard, one-hour lifetime,
+`demo-shop.test`) exists only in the disposable database; these are not runtime
+defaults. No payment results are simulated or stored.
+
+The rehearsal starts its own private temporary PostgreSQL cluster with a Unix
+socket and no TCP listener. The application listens only on loopback, uses
+explicit local development cookies, blocks all PayPal routes except read-only
+status, never loads `.env`/`runtime.env`, and removes its temporary database on
+normal shutdown with Ctrl-C. Do not tunnel this rehearsal to the internet.
+
+### Use the real application later
+
+Keep the existing private `DATABASE_URL`, Vault keyring, Owner and secure HTTPS
+origin configuration. Do not rerun provisioning, migrations, HBA setup or
+bootstrap for this frontend. The current public server is not automatically
+restarted by a frontend build or by the rehearsal.
+
+Live shopping additionally requires server-only `CHANNEL3_API_KEY`,
+`OPENAI_API_KEY`, and `AGENTPAL_MODEL` (an available **OpenAI model ID**, without
+an `openai:` prefix). Model requests use the fixed OpenAI API origin, no
+environment proxies or redirects, no SDK retries, bounded output/time, and
+context-scoped SDK log suppression. No tracing service is configured. The
+frontend never receives model/provider keys. The application loads no dotenv
+file automatically and never falls back to rehearsal mode if keys are absent.
+There has been no live model/provider request in this implementation task.
+
+The persistent runtime currently has **no enabled agent and no policy**. Runtime
+grants intentionally prohibit inserting agents. [The review-only registration
+SQL](docs/mvp_runtime_agent.sql) creates one enabled `Shopping agent` through the
+existing owner role, targets only `agentpal_dev` at revision `0006`, and changes
+no grants, schema or credentials. It has **not been executed**. Applying it,
+adding private model configuration and restarting the public application require
+operator authorization. Then the Owner chooses real financial values through
+the workspace's **Spending policy** form; no example policy is applied to the
+persistent database.
+
+### PayPal enrollment diagnosis — October 22, 2026
+
+The latest attempt is **canceled**, with callback receipt but no approved setup,
+payment token, saved payment method or verified agreement. The earlier attempt
+is expired. The generic callback return message is not success evidence. The
+hosted error was: “This PayPal account is associated with the merchant you're
+trying to pay.” The setup payload requests `IMMEDIATE / MERCHANT / CONSUMER` and
+the disclosure, with no hard-coded payer/login hint. No local integration
+misconfiguration explaining the account conflict was found. The actual selected
+hosted account, whether a cached merchant login was used, and the current app's
+Business-versus-intended-Personal account identity cannot be conclusively
+established from local metadata. Enrollment is paused; no new API attempt is
+needed to develop or rehearse the shopping/approval slice. Historical successful
+Sandbox payments remain valid separate spike evidence, not verification of this
+new agreement.
+
+Focused regression coverage: `tests/test_shopping.py`; full suite: `rtk proxy uv
+run pytest -q`. Provider tests are synthetic and PostgreSQL databases disposable.
+
 The [authoritative context](docs/AgentPal_Full_Context_Handoff.md) records approved
 decisions, completed experiments and remaining integration work.
 
@@ -60,11 +178,10 @@ are fictional fixtures; no PayPal or Channel3 calls occur.
 ## Channel3 discovery and transient offer selection
 
 `agentpal.channel3` and `agentpal.discovery` provide reusable asynchronous backend
-functions. They add no HTTP endpoints, so there is no unauthenticated discovery
-surface or new owner-session bypass. The future trusted agent runtime must bind
-these functions to its authenticated owner and verified agent/run context. No
-PydanticAI agent or payment is implemented. The proposal service below consumes
-this foundation for independent retrieval and deterministic initial evaluation.
+functions. The authenticated shopping runtime above binds these functions to
+the trusted Owner/agent/run context; there is no unauthenticated discovery
+surface or owner-session bypass. The proposal service below consumes this
+foundation for independent retrieval and deterministic initial evaluation.
 
 Privately export `CHANNEL3_API_KEY` before constructing `Channel3Settings()`.
 The variable already appears as an empty placeholder in `.env.example`; no dotenv
@@ -755,7 +872,8 @@ approve a purchase, reserve budget, place an order, capture funds or change the
 receiving merchant. The configured Sandbox Business application's credentials
 identify AgentPal's merchant; the returned Vault customer is the payer. Neither
 payer/customer references nor callback parameters set `sandbox_business_account_id`.
-There are no AI authorization tools or frontend pages in this slice.
+AI has no authorization tools. The Owner workspace above now consumes these
+Owner-only APIs for explicit human decisions.
 
 ### Configuration and encrypted storage
 

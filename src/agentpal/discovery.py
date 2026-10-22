@@ -155,6 +155,9 @@ class DiscoveryService:
     def __init__(self, client: Channel3Client, registry: OfferRegistry):
         self._client, self._registry = client, registry
 
+    def discard_run(self, context: RunContext) -> None:
+        self._registry.discard_run(context)
+
     async def search(self, context: RunContext, query: str, *, limit: int = 3) -> DiscoveryResult:
         if not isinstance(context, RunContext):
             raise ValueError("invalid_run_context")

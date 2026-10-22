@@ -1,7 +1,7 @@
 # AgentPal — Full Project Context & Progress Handoff
 
 **Last updated:** 2026-10-22
-**Status:** PayPal/Channel3 feasibility and the FastAPI foundation passed. PostgreSQL persistence, owner authentication/policy/budget APIs, Channel3 discovery, idempotent proposals, secure human purchase approval/read APIs, secure PayPal Sandbox Vault onboarding, trusted pre-dispatch financial preparation and gated encrypted Orders request materialization are implemented. New Vault onboarding explicitly requests and verifies the supported on-demand agreement, with safe owner-driven replacement; legacy/insufficient evidence remains blocked. Provider behavior is tested offline with synthetic fixtures; live adapter compatibility remains unverified. Payment execution/reconciliation, agent runtime and end-to-end execution remain unimplemented.
+**Status:** The React/TypeScript Owner workspace and PydanticAI shopping orchestration now connect the existing discovery, independently refreshed offers, deterministic policy evaluation, durable proposals and human approval APIs. The vertical slice is tested with synthetic provider/model responses and disposable PostgreSQL. A clearly labeled loopback-only offline rehearsal is runnable; live AI/product integration and a judge-ready deployment remain unverified. The persistent database/Owner/keyring are initialized at revision 0006, but a runtime agent, Owner-selected spending policy and model configuration remain prerequisites for live shopping. PayPal's latest hosted attempt was canceled after a merchant/payer account conflict; there is no saved method or verified agreement. Enrollment is paused. Existing financial guards remain unchanged. Payment execution and reconciliation remain unimplemented and disabled.
 
 **Purpose:** The single authoritative project context for the existing AgentPal repository.
 
@@ -20,7 +20,7 @@
 
 ## 2. Product, demonstration, and disclosure
 
-**AgentPal is a policy-controlled AI procurement/payment simulation for one human owner.** A planned PydanticAI agent discovers and compares external product listings through Channel3 and proposes purchases. FastAPI independently retrieves the selected listing, applies owner policies, obtains human approval when required, and controls PayPal Sandbox execution. PostgreSQL will enforce shared-budget correctness and preserve the audit trail. React/TypeScript and AG Grid are planned for the operational interface; AG Studio analytics remain optional pending licensing and integration review.
+**AgentPal is a policy-controlled AI procurement/payment simulation for one human owner.** The implemented PydanticAI orchestration discovers and selects external listings through Channel3 and proposes purchases. FastAPI independently retrieves the selected listing, applies Owner policies and obtains human approval when required. PostgreSQL enforces financial constraints and preserves the audit trail. React/TypeScript provides the minimal Owner workspace. Live AI/product-source verification remains pending; the offline rehearsal explicitly uses a scripted model and synthetic listings. Payment execution is disabled. AG Grid remains a potential later UI enhancement; AG Studio analytics remain optional pending licensing and integration review.
 
 > **Prominent demo disclosure:** Channel3 discovers external retailer listings, while every demonstration payment goes to **AgentPal's single PayPal Sandbox Business account**. The simulation does **not** place or fulfill an actual order with Lenovo, Best Buy, or any other catalog retailer. Catalog merchants are listing sources; they are not necessarily PayPal payees. This disclosure must remain clear in the application, demo, and submission materials.
 
@@ -170,7 +170,7 @@ approved behavior and are not application defaults.
 
 | Layer | Responsibility | Boundary |
 |---|---|---|
-| AI / planned PydanticAI agent | External product discovery, comparison, explanations, structured proposals | Cannot supply authoritative prices/merchant identity, change policy or budgets, approve itself, or call PayPal directly |
+| AI / PydanticAI orchestration | Interpret requests, discover products and select an evidence-bound offer for a proposal | Cannot supply authoritative prices/merchant identity, change policy or budgets, approve itself, or call PayPal directly |
 | FastAPI backend | Independent listing retrieval/validation, policy evaluation, owner approval, durable orchestration, controlled PayPal payee | Must not turn unverified model output or merchant content into financial authorization |
 | PostgreSQL | Transactions, constraints, durable snapshots, reservations, accounting and audit | Must enforce shared-budget and duplicate-prevention invariants despite concurrent requests or crashes |
 | Human owner session | Policy/payment configuration and human approval | AI tool calls cannot confer human authority |
@@ -198,14 +198,14 @@ Approval must bind to the unchanged purchase snapshot, verified human identity, 
 | Packaging | `pyproject.toml`: project version `0.1.0`, Python `>=3.12`, uv build backend; `uv.lock` present |
 | Existing dependencies | FastAPI/HTTPX/Pydantic stack plus SQLAlchemy 2.0, psycopg 3, Alembic, argon2-cffi and cryptography for AES-GCM; pytest is a development dependency, with exact resolution in `uv.lock` |
 | Package entry point | `src/agentpal/__init__.py` still contains the starter CLI greeting; it is not completed application orchestration |
-| Agent | PydanticAI planned; no live integration implemented |
-| Product discovery | `channel3.py` fixed-origin search/detail adapter and `discovery.py` bounded transient references/independent comparison implemented offline; no HTTP routes or agent runtime |
+| Agent | PydanticAI structured planning/selection implemented and tested with mock HTTP; live model credentials and verification remain pending |
+| Product discovery | `channel3.py` fixed-origin search/detail adapter and `discovery.py` bounded references/independent comparison, now called by the authenticated shopping runtime; live compatibility remains pending |
 | Payments | Historical Vault/Orders spike passed; Sandbox Vault onboarding now integrated into FastAPI with mocked verification; Orders/Capture services remain unimplemented |
 | Database | PostgreSQL-native SQL schema, Alembic revisions `0001`–`0005`, SQLAlchemy Core/psycopg connections and database guards implemented; no duplicate ORM schema |
 | Local database setup | Tests start isolated local PostgreSQL clusters; PostgreSQL 18.6 is available and was used. No persistent database or Compose service was provisioned |
 | Owner access | Interactive owner bootstrap and `/auth/login`, `/auth/me`, `/auth/logout` implemented; no public registration |
 | Policy / budget services | Owner-only configuration/history/current budget and human approval/read APIs plus reusable proposal evaluation and source-verified atomic financial preparation/reservation implemented; payment dispatch absent |
-| Frontend | React/TypeScript planned; exact framework OPEN; no integrated AgentPal frontend |
+| Frontend | React/TypeScript with Vite, built and served by FastAPI at the same origin; minimal Owner workspace implemented |
 | Operational UI / analytics | AG Grid planned; AG Studio optional; both require appropriate licensing review |
 | Hosting | Render + Neon previously tentative; hosting is not a binding approved choice and deployment is unverified |
 
@@ -1221,18 +1221,18 @@ Historical schedule context: submissions opened October 1, 2026, at 9:15 AM PT; 
 | AG Studio install, custom data, grid, Edit Mode, charts, persistence | **PASSED, separate spike:** Section 10 |
 | AG Studio AI Assistant / judging license | **UNCONFIRMED / UNRESOLVED** |
 | FastAPI app metadata and `GET /health` | **IMPLEMENTED; prior import/TestClient verification passed** |
-| PostgreSQL persistence / migrations / invariant tests | **IMPLEMENTED:** native SQL/Alembic, disposable PostgreSQL integration/concurrency tests; no persistent database provisioned |
+| PostgreSQL persistence / migrations / invariant tests | **IMPLEMENTED:** native SQL/Alembic; persistent local `agentpal_dev` at 0006, restricted SCRAM runtime and disposable PostgreSQL tests |
 | Single-owner authentication | **IMPLEMENTED:** secure bootstrap, Argon2id login, durable sessions/revocation, CSRF and reusable owner dependencies |
-| Vault onboarding in app | **IMPLEMENTED offline:** owner initiation, Strict-cookie-safe callback/CSRF completion, independent v3 verification, AEAD storage and durable conservative recovery; real hosted-browser/provider smoke test remains pending |
+| Vault onboarding in app | **IMPLEMENTED:** hosted attempts reached Sandbox consent but merchant/payer account conflict prevented completion; latest canceled, no verified method. Enrollment paused; no bypass or automatic retry |
 | Owner policy configuration/history and current-month budget API | **IMPLEMENTED:** authenticated, CSRF-protected writes, immutable versions and atomic immediate limits under Decision 25 |
-| Purchase proposals and initial deterministic policy evaluation | **IMPLEMENTED:** independent refresh, immutable decisions/rule traces, exact totals and context-bound durable idempotency; no HTTP routes |
+| Purchase proposals and initial deterministic policy evaluation | **IMPLEMENTED:** independently refreshed offers, immutable rule traces/exact totals, context-bound proposal idempotency; authenticated shopping HTTP orchestration now available |
 | Human purchase approval and safe inspection | **IMPLEMENTED:** owner queue/details, explicit snapshot-bound approval/denial, immutable audit, idempotency and commit-time expiry/session guard |
 | Financial readiness/reservation/preparation | **IMPLEMENTED offline:** trusted run-bound source verification, atomic shared-budget hold and prepared payment, replay and safe unsent release |
 | Orders request materialization | **IMPLEMENTED offline, agreement gated**: exact encrypted operation bytes/identity and six-hour endpoint evidence; legacy/insufficient agreements remain blocked; new explicit verified agreements can pass offline |
 | Payment dispatch/reconciliation services | **NOT IMPLEMENTED**; no dispatch claim or fabricated provider outcome |
 | Database idempotency, accounting and retry guards | **IMPLEMENTED**; HTTP/provider orchestration and reconciliation services are **NOT IMPLEMENTED** |
-| Live PydanticAI / Channel3 / PayPal application integration | Reusable Channel3 adapter implemented but not called live in this task; agent orchestration and live application verification remain pending; Sandbox Vault adapter implemented with mocks, payment dispatch absent |
-| Integrated frontend / end-to-end AgentPal execution / judge-ready demo | **NOT COMPLETED** |
+| PydanticAI / Channel3 application integration | **IMPLEMENTED, offline-tested:** two bounded structured model calls, trusted context, independent source refresh and deterministic proposal service. No Owner/model payment capability. Live model/key and source compatibility remain unverified |
+| Owner frontend / request-to-approval vertical slice | **IMPLEMENTED:** same-origin React/TypeScript login, policies/budget, read-only Vault status, proposals and human decisions; explicit isolated offline rehearsal. Public update and judge-ready live demo remain pending |
 | PayPal webhooks | **EXCLUDED from MVP**, not a pending integration milestone |
 
 The required vertical slice is external discovery → safe selected offer → immutable proposal → deterministic policy/owner approval → shared-budget reservation → vaulted Sandbox payment → accurate persisted result/audit and useful UI. It includes the simulation disclosure, secure judging access, README, public open-source repository and concise English demo.
@@ -1269,9 +1269,9 @@ Context consolidation, all 25 decisions, PostgreSQL persistence/hardening, owner
 1. Verify real Channel3 adapter compatibility and data-use permissions in a separately authorized bounded check; offline fixtures do not establish live compatibility.
 2. Separately authorize the documented manual HTTPS Sandbox Vault smoke test and external key provisioning; do not treat mocks or the historical spike as proof of the new adapter/browser flow.
 3. Perform the separately authorized HTTPS Sandbox agreement smoke test below, including account capability and affirmative returned metadata. Explicit agreement onboarding/replacement and encrypted materialization are implemented offline; missing/legacy evidence stays blocked. Then implement final source/financial/crypto/contract gates, durable dispatch claims and actual payment/reconciliation in separately authorized slices, reusing committed bytes/identity and endpoint retention.
-4. Integrate PydanticAI and the frontend; verify end-to-end execution and prepare the public licensed source, setup/judging access and concise English demonstration.
+4. Rehearse the implemented request-to-approval slice using `agentpal.demo`. Separately authorize private live-model configuration, runtime agent registration and public application update; the Owner then sets financial values through the UI. Verify bounded live model/Channel3 behavior before describing it as proven AI integration. Prepare the public licensed source, setup/judging access and concise English demonstration. PayPal enrollment is paused and must not block this product work.
 
-The implemented foundations include reusable source retrieval, durable initial proposals and owner purchase-read/human-approval endpoints, Sandbox Vault onboarding and trusted financial preparation/release, but no discovery HTTP/AI runtime, checkout, payment execution, frontend or end-to-end purchasing system.
+The implemented application now includes an authenticated HTTP shopping runtime, PydanticAI model adapter, React Owner workspace, durable proposal history and request-to-human-approval integration. The clearly labeled offline rehearsal uses a disposable database, synthetic Channel3 HTTP responses and scripted PydanticAI TestModel; it does not prove real AI reasoning, current product data or PayPal success. No payment results are simulated or stored. Retailer checkout/fulfillment and payment execution/reconciliation remain absent. See the README's MVP section and review-only `docs/mvp_runtime_agent.sql`; existing secrets, schema and grants were not changed by this implementation.
 
 ---
 

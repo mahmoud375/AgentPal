@@ -13,8 +13,11 @@ dependencies = [
     "cryptography>=46,<48",
     "fastapi>=0.156.1",
     "httpx>=0.28.1",
+    "httpx2>=2.16,<3",
+    "openai>=3.37,<4",
     "psycopg[binary]>=3.2,<4",
     "pydantic>=2.14.1",
+    "pydantic-ai-slim[openai]>=2.59,<3",
     "pydantic-settings>=2.16.1",
     "python-dotenv>=1.2.4",
     "sqlalchemy>=2.0,<2.1",
@@ -24,6 +27,7 @@ dependencies = [
 [project.scripts]
 agentpal = "agentpal:main"
 agentpal-bootstrap = "agentpal.auth.bootstrap:main"
+agentpal-demo = "agentpal.demo:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]

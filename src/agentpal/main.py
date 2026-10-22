@@ -1,8 +1,11 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import Lock
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Engine
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
@@ -13,6 +16,7 @@ from agentpal.policy import router as policy_router
 from agentpal.approvals import router as approval_router
 from agentpal.vault.api import router as vault_router
 from agentpal.vault.security import VaultUnavailable
+from agentpal.shopping import router as shopping_router
 
 
 def create_app(*, settings: AuthSettings | None = None, engine: Engine | None = None) -> FastAPI:
@@ -32,10 +36,13 @@ def create_app(*, settings: AuthSettings | None = None, engine: Engine | None = 
     application.state.auth_owned_engine = False
     application.state.auth_service = AuthService(engine, settings) if engine is not None else None
     application.state.vault_service = None
+    application.state.shopping_runtime = None
+    application.state.shopping_admission = Lock()
     application.include_router(router)
     application.include_router(policy_router)
     application.include_router(approval_router)
     application.include_router(vault_router)
+    application.include_router(shopping_router)
 
     @application.middleware("http")
     async def authentication_headers(request: Request, call_next):
@@ -45,13 +52,20 @@ def create_app(*, settings: AuthSettings | None = None, engine: Engine | None = 
             request.scope["vault_callback_query"] = request.scope.get("query_string", b"")
             request.scope["query_string"] = b""
         response = await call_next(request)
-        if request.url.path.startswith(("/auth/", "/policy", "/budget/", "/purchases/", "/paypal/vault/")):
+        if request.url.path.startswith(("/auth/", "/policy", "/budget/", "/purchases", "/shopping/", "/paypal/vault/")):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Pragma"] = "no-cache"
             response.headers["X-Content-Type-Options"] = "nosniff"
         if request.url.path.startswith("/paypal/vault/"):
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+        if request.url.path == "/" or request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                "connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
         return response
 
     @application.exception_handler(VaultUnavailable)
@@ -81,6 +95,18 @@ def create_app(*, settings: AuthSettings | None = None, engine: Engine | None = 
     @application.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # Vite output is served by FastAPI at the same origin as the cookie APIs.
+    # No catch-all route that could turn mistyped API paths into HTML successes.
+    frontend = Path(__file__).parent / "web"
+    if (frontend / "assets").is_dir():
+        application.mount("/assets", StaticFiles(directory=frontend / "assets"), name="frontend-assets")
+
+    @application.get("/", include_in_schema=False)
+    def owner_workspace():
+        if not (frontend / "index.html").is_file():
+            return JSONResponse(status_code=503, content={"detail": "Build the frontend: npm --prefix frontend run build"})
+        return FileResponse(frontend / "index.html")
 
     return application
 

@@ -242,6 +242,15 @@ def approval_queue(owner: OwnerRead, service: Service, limit: Annotated[int, Que
     return ApprovalQueue(items=[_view(row) for row in rows[:limit]], limit=limit, offset=offset, has_more=len(rows)>limit)
 
 
+@router.get("", response_model=ApprovalQueue)
+def purchase_history(owner: OwnerRead, service: Service, limit: Annotated[int, Query(ge=1, le=100)] = 20,
+                     offset: Annotated[int, Query(ge=0, le=10000)] = 0):
+    with service.engine.connect() as c:
+        rows = c.execute(text(_READ + " ORDER BY p.created_at DESC,p.id DESC LIMIT :limit OFFSET :offset"),
+                         {"limit": limit+1, "offset": offset}).mappings().all()
+    return ApprovalQueue(items=[_view(row) for row in rows[:limit]], limit=limit, offset=offset, has_more=len(rows)>limit)
+
+
 @router.get("/{purchase_id}", response_model=PurchaseView)
 def get_purchase(purchase_id: UUID, owner: OwnerRead, service: Service):
     with service.engine.connect() as c:

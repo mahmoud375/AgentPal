@@ -6,3 +6,6 @@ node_modules/
 dist/
 .DS_Store
 .pytest_cache/
+src/agentpal/web/
+output/playwright/
+.playwright-cli/
